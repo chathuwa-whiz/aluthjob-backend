@@ -7,9 +7,9 @@ import { startMailWorker } from "./mail/worker.js";
 
 const port = Number(process.env.PORT ?? 4000);
 
-app.listen(port, "127.0.0.1", () => {
+app.listen(port, "0.0.0.0", () => {
   console.log(
-    `API running at http://127.0.0.1:${port}`
+    `API running at http://0.0.0.0:${port}`
   );
 });
 
