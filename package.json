@@ -1,0 +1,47 @@
+{
+  "name": "server",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit",
+    "ingest": "tsx src/scripts/ingest.ts",
+    "test": "tsx --test \"src/**/*.test.ts\"",
+    "match": "tsx src/scripts/match.ts",
+    "enrich": "tsx src/scripts/enrich.ts",
+    "make-admin": "tsx src/scripts/make-admin.ts",
+    "assign-candidate": "tsx src/scripts/assign-candidate.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cheerio": "^1.2.0",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.9",
+    "express": "^5.3.0",
+    "helmet": "^8.3.0",
+    "mammoth": "^1.13.0",
+    "multer": "^2.5.0",
+    "nodemailer": "^10.2.1",
+    "ollama": "^0.6.4",
+    "pdf-parse": "^2.4.5",
+    "tesseract.js": "^7.0.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/multer": "^2.3.0",
+    "@types/node": "^26.6.5",
+    "@types/nodemailer": "^8.0.2",
+    "@types/pdf-parse": "^1.1.5",
+    "@types/smtp-server": "^3.5.13",
+    "smtp-server": "^3.21.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
