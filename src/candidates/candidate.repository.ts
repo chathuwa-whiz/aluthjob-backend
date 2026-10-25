@@ -86,6 +86,16 @@ export async function listCandidatesOf(userId: number): Promise<Candidate[]> {
     return rows.map(toCandidate);
 }
 
+/** Administrators only: moves a resume to another account (or to nobody). */
+export async function setCandidateOwner(candidateId: number, userId: number | null): Promise<boolean> {
+    return (await getDatabase().run("UPDATE candidates SET user_id = ?, updated_at = ? WHERE id = ?", [userId, new Date().toISOString(), candidateId])).changes === 1;
+}
+
+/** Deletes the resume with its matches, mailbox and applications (ON DELETE CASCADE). */
+export async function deleteCandidate(candidateId: number): Promise<boolean> {
+    return (await getDatabase().run("DELETE FROM candidates WHERE id = ?", [candidateId])).changes > 0;
+}
+
 /** Gives an ownerless (pre-accounts) resume to a user. Used by the `assign-candidate` script, never by the API. */
 export async function assignCandidateOwner(candidateId: number, userId: number): Promise<boolean> {
     return (await getDatabase().run("UPDATE candidates SET user_id = ? WHERE id = ? AND user_id IS NULL", [userId, candidateId])).changes === 1;

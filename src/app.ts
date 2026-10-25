@@ -5,7 +5,7 @@ import helmet from "helmet";
 import { ZodError, z } from "zod";
 import multer from "multer";
 
-import { allowedOrigins, originGuard, requireAuth, requireVerified } from "./auth/middleware.js";
+import { allowedOrigins, originGuard, requireAdmin, requireAuth, requireVerified } from "./auth/middleware.js";
 import { BadRequestError, ConfigError, EmailNotVerifiedError, ForbiddenError, NotFoundError, RuleError, TooManyRequestsError, UnauthorizedError } from "./errors.js";
 import authRoutes from "./routes/auth.routes.js";
 import resumeRoutes from "./routes/resume.routes.js";
@@ -13,6 +13,7 @@ import jobRoutes from "./routes/job.routes.js";
 import candidateRoutes from "./routes/candidate.routes.js";
 import matchRoutes from "./routes/match.routes.js";
 import applicationRoutes from "./routes/application.routes.js";
+import adminRoutes from "./routes/admin.routes.js";
 
 const app = express();
 
@@ -44,6 +45,8 @@ app.use("/api/v1/jobs", jobRoutes);
 app.use("/api/v1/candidates", candidateRoutes);
 app.use("/api/v1/matches", matchRoutes);
 app.use("/api/v1/applications", applicationRoutes);
+// The administrators' console: works across accounts, so the role check sits in front of the whole router
+app.use("/api/v1/admin", requireAdmin, adminRoutes);
 
 app.use((
     error: Error,

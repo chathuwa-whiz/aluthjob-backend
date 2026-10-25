@@ -57,6 +57,17 @@ export function resetLlmClient(): void {
 
 export const llmProvider = () => (groqPool() ? ("groq" as const) : ("ollama" as const));
 
+/** Which model answers and how healthy the API keys are. Holds no key material. */
+export function llmStatus() {
+    const keys = groqPool();
+    return {
+        provider: llmProvider(),
+        groqModel: GROQ_MODEL(),
+        ollamaModel: OLLAMA_MODEL(),
+        keys: keys ? keys.status() : { total: 0, usable: 0, resting: [] },
+    };
+}
+
 export async function chat(request: ChatRequest, onChunk: OnChunk = () => {}): Promise<ChatResult> {
     const keys = groqPool();
     if (!keys) return ollamaChat(request, onChunk);

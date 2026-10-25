@@ -1,6 +1,7 @@
 import { getDatabase } from "../db/database.js";
 import { RuleError } from "../errors.js";
 import { ingestAll, type IngestResult, type SiteEvent } from "./ingest.service.js";
+import type { JobSourceId } from "./types.js";
 
 export interface StoreStatus {
     total: number;
@@ -23,9 +24,18 @@ export function isStale(status: StoreStatus, now = Date.now()): boolean {
 // ---- collecting, one run at a time -----------------------------------------------------
 
 type SiteListener = (event: SiteEvent) => void;
-type Collector = (report: SiteListener) => Promise<IngestResult[]>;
 
-const realCollector: Collector = (report) => ingestAll(undefined, undefined, report);
+/** Narrows a collection to some of the job sites and/or fewer listing pages. Without it every site is read in full. */
+export interface CollectionScope {
+    sources?: JobSourceId[];
+    maxPages?: number;
+    /** Who asked, for the administrators' status screen. */
+    trigger?: string;
+}
+
+type Collector = (report: SiteListener, scope?: CollectionScope) => Promise<IngestResult[]>;
+
+const realCollector: Collector = (report, scope) => ingestAll(scope?.sources, scope?.maxPages, report);
 let collector: Collector = realCollector;
 /** For tests: replaces the real job-site collector. Pass nothing to restore it. */
 export const setCollector = (replacement?: Collector) => {
@@ -37,23 +47,75 @@ let inflight: Promise<IngestResult[]> | undefined;
 const sites = new Map<string, SiteEvent>();
 const listeners = new Set<SiteListener>();
 
+export interface CollectionRun {
+    startedAt: string;
+    finishedAt: string | null;
+    trigger: string;
+    results: IngestResult[];
+    /** Set when the whole collection failed, as opposed to single sites (those are in `results`). */
+    error: string | null;
+}
+
+let current: CollectionRun | undefined;
+let last: CollectionRun | undefined;
+
 function publish(event: SiteEvent) {
     sites.set(event.source, event);
     for (const listener of listeners) listener(event);
 }
 
 /**
- * Collects vacancies from every job site. Only one collection runs at a time: a search that needs fresh
- * data while the scheduler is already collecting simply waits for that run, instead of hitting every site twice.
+ * Collects vacancies from the job sites (all of them unless `scope` narrows it). Only one collection runs at a
+ * time: a search that needs fresh data while the scheduler is already collecting simply waits for that run,
+ * instead of hitting every site twice. A `scope` passed while one is running is ignored for that reason.
  */
-export function collectVacancies(): Promise<IngestResult[]> {
+export function collectVacancies(scope?: CollectionScope): Promise<IngestResult[]> {
     if (!inflight) {
         sites.clear();
-        inflight = collector(publish).finally(() => {
-            inflight = undefined;
-        });
+        const run: CollectionRun = { startedAt: new Date().toISOString(), finishedAt: null, trigger: scope?.trigger ?? "automatic", results: [], error: null };
+        current = run;
+
+        const finish = (results: IngestResult[], error: string | null) => {
+            last = { ...run, finishedAt: new Date().toISOString(), results, error };
+            current = undefined;
+        };
+
+        inflight = collector(publish, scope)
+            .then(
+                (results) => {
+                    finish(results, null);
+                    return results;
+                },
+                (error: unknown) => {
+                    finish([], error instanceof Error ? error.message : String(error));
+                    throw error;
+                },
+            )
+            .finally(() => {
+                inflight = undefined;
+            });
     }
     return inflight;
+}
+
+export interface CollectionStatus {
+    running: boolean;
+    startedAt: string | null;
+    trigger: string | null;
+    /** What each job site is doing in the running collection (empty when none runs). */
+    sites: SiteEvent[];
+    /** The latest collection that finished since the server started. */
+    last: CollectionRun | null;
+}
+
+export function collectionStatus(): CollectionStatus {
+    return {
+        running: Boolean(inflight),
+        startedAt: current?.startedAt ?? null,
+        trigger: current?.trigger ?? null,
+        sites: [...sites.values()],
+        last: last ?? null,
+    };
 }
 
 /** Follows the running collection: replays what each site is doing now, then every change. Returns a function that stops following. */

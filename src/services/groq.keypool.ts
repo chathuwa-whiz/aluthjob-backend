@@ -30,6 +30,15 @@ export class KeyPool {
         return times.length ? Math.min(...times) : Infinity;
     }
 
+    /** How many keys are usable now and how long each resting one still rests (never the keys themselves). */
+    status(): { total: number; usable: number; resting: { key: string; seconds: number }[] } {
+        const resting = this.keys
+            .map((key) => ({ key: this.label(key), seconds: Math.ceil(((this.benchedUntil.get(key) ?? 0) - this.now()) / 1000) }))
+            .filter((entry) => entry.seconds > 0);
+
+        return { total: this.keys.length, usable: this.keys.length - resting.length, resting };
+    }
+
     /** 1-based position of the key, for logs that must never show the key itself. */
     label(key: string): string {
         return `key ${this.keys.indexOf(key) + 1}/${this.keys.length}`;

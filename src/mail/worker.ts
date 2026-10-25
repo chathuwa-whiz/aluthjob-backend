@@ -6,6 +6,11 @@ const BUSY_POLL_MS = 2_000;
 
 let timer: NodeJS.Timeout | undefined;
 let running = false;
+let lastTick: { at: string; result: string } | undefined;
+let lastError: { at: string; message: string } | undefined;
+
+/** For the administrators' system screen. */
+export const mailWorkerStatus = () => ({ running, lastTick: lastTick ?? null, lastError: lastError ?? null });
 
 /**
  * Drains the application queue in the background. Only one message is handled per tick, and the
@@ -20,10 +25,13 @@ export function startMailWorker(): void {
 
         try {
             const result = await processNext();
+            lastTick = { at: new Date().toISOString(), result };
             if (result === "sent" || result === "failed" || result === "cancelled") next = BUSY_POLL_MS;
             if (result === "sent") console.log("Application sent");
         } catch (error) {
-            console.error("Mail worker error:", error instanceof Error ? error.message : error);
+            const message = error instanceof Error ? error.message : String(error);
+            lastError = { at: new Date().toISOString(), message };
+            console.error("Mail worker error:", message);
         }
 
         if (running) timer = setTimeout(tick, next).unref();

@@ -8,7 +8,7 @@ after(() => closeDatabase());
 /** Empties every table, children first. Only ever runs against the TEST_ORACLE_* database (see test-env.ts). */
 export async function clearDatabase(): Promise<void> {
     const db = getDatabase();
-    for (const table of ["applications", "mail_accounts", "matches", "candidates", "email_tokens", "sessions", "users", "jobs"]) {
+    for (const table of ["admin_audit", "applications", "mail_accounts", "matches", "candidates", "email_tokens", "sessions", "users", "jobs"]) {
         await db.run(`DELETE FROM ${table}`);
     }
 }
