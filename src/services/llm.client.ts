@@ -3,7 +3,8 @@ import { KeyPool, parseKeys } from "./groq.keypool.js";
 
 /**
  * One entry point for every model call. With GROQ_API_KEYS set the request goes to Groq, spread over
- * all keys and moved to the next key the moment one is rate limited; without keys it uses local Ollama.
+ * all keys and moved to the next key the moment one is rate limited; if Groq fails altogether (or no
+ * keys are set) the local Ollama model answers.
  * The same model reads resumes and writes cover letters.
  */
 export interface ChatRequest {
@@ -58,7 +59,22 @@ export const llmProvider = () => (groqPool() ? ("groq" as const) : ("ollama" as 
 
 export async function chat(request: ChatRequest, onChunk: OnChunk = () => {}): Promise<ChatResult> {
     const keys = groqPool();
-    return keys ? groqChat(keys, request, onChunk) : ollamaChat(request, onChunk);
+    if (!keys) return ollamaChat(request, onChunk);
+
+    try {
+        return await groqChat(keys, request, onChunk);
+    } catch (groqError) {
+        // Every key limited, rejected or unreachable (or Groq refused the request): the local model takes over
+        const reason = groqError instanceof Error ? groqError.message : String(groqError);
+        console.warn(`Groq failed (${reason}); falling back to local model ${OLLAMA_MODEL()}`);
+
+        try {
+            return await ollamaChat(request, onChunk);
+        } catch (localError) {
+            const local = localError instanceof Error ? localError.message : String(localError);
+            throw new Error(`Groq failed (${reason}) and the local model failed too (${local})`);
+        }
+    }
 }
 
 // ---- Groq ------------------------------------------------------------------------------

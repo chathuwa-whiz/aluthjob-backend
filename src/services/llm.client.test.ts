@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, before, beforeEach, describe, it } from "node:test";
-import { chat, LlmBusyError, resetLlmClient } from "./llm.client.js";
+import { chat, resetLlmClient } from "./llm.client.js";
+import { ollama } from "./ollama.client.js";
 import { KeyPool, parseKeys } from "./groq.keypool.js";
 
 /** Stands in for Groq: each key is limited, rejected or working, and every call is recorded. */
@@ -97,11 +98,56 @@ describe("Groq with several keys", () => {
         assert.equal((await ask()).content, "hello from key-c");
     });
 
-    it("reports when every key is limited, with when to retry", async () => {
-        for (const key of ["key-a", "key-b", "key-c"]) behaviour.set(key, "limited");
+});
 
-        await assert.rejects(ask(), (error: unknown) => error instanceof LlmBusyError && error.retryAfterSeconds > 0);
-        assert.equal(calls.length, 3, "each key was tried once");
+describe("local fallback", () => {
+    const local = ollama as unknown as { chat: unknown };
+    const original = local.chat;
+    const allLimited = () => ["key-a", "key-b", "key-c"].forEach((key) => behaviour.set(key, "limited"));
+    const fakeLocal = (fail = false) => {
+        local.chat = async () => {
+            if (fail) throw new Error("connect ECONNREFUSED");
+            return (async function* () {
+                yield { message: { content: "hello from " }, done: false };
+                yield { message: { content: "ollama" }, done: true, done_reason: "stop" };
+            })();
+        };
+    };
+    after(() => {
+        local.chat = original;
+    });
+
+    it("answers from the local model when every Groq key is limited", async () => {
+        allLimited();
+        fakeLocal();
+
+        assert.equal((await ask()).content, "hello from ollama");
+        assert.equal(calls.length, 3, "all Groq keys were tried first");
+    });
+
+    it("does not touch the local model while a Groq key works", async () => {
+        behaviour.set("key-a", "limited");
+        let used = false;
+        local.chat = async () => ((used = true), (async function* () {})());
+
+        assert.equal((await ask()).content, "hello from key-b");
+        assert.equal(used, false);
+    });
+
+    it("uses the local model when no keys are configured", async () => {
+        delete process.env.GROQ_API_KEYS;
+        resetLlmClient();
+        fakeLocal();
+
+        assert.equal((await ask()).content, "hello from ollama");
+        assert.equal(calls.length, 0);
+    });
+
+    it("says so when the local model fails too", async () => {
+        allLimited();
+        fakeLocal(true);
+
+        await assert.rejects(ask(), /Groq failed.*rate limited.*local model failed too.*ECONNREFUSED/s);
     });
 });
 
