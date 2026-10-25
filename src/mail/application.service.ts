@@ -70,12 +70,10 @@ export interface PreparedMessage {
 }
 
 /** `to` is the address validated and stored when the application was queued; the ad's own is used for previews. */
-function prepare(match: Match, to = match.job.applyEmail) {
-    const candidate = getCandidate(match.candidateId);
-    const file = getCandidateFile(match.candidateId);
+async function prepare(match: Match, to = match.job.applyEmail) {
+    const [candidate, file, account] = await Promise.all([getCandidate(match.candidateId), getCandidateFile(match.candidateId), getMailAccount(match.candidateId)]);
     if (!candidate || !file) throw new NotFoundError("Candidate not found");
 
-    const account = getMailAccount(match.candidateId);
     const fromName = account?.fromName ?? candidate.profile.personalInfo.fullName ?? undefined;
 
     const mail: Mail.Options = {
@@ -98,11 +96,11 @@ function prepare(match: Match, to = match.job.applyEmail) {
 }
 
 /** The exact message that would be sent, plus whatever currently blocks it. */
-export function previewMessage(matchId: number): { message: PreparedMessage; problems: string[] } {
-    const match = getMatch(matchId);
+export async function previewMessage(matchId: number): Promise<{ message: PreparedMessage; problems: string[] }> {
+    const match = await getMatch(matchId);
     if (!match) throw new NotFoundError("Match not found");
 
-    const { mail, account, file } = prepare(match);
+    const { mail, account, file } = await prepare(match);
 
     return {
         message: {
@@ -122,11 +120,11 @@ export function previewMessage(matchId: number): { message: PreparedMessage; pro
 // ---- queueing --------------------------------------------------------------------------
 
 /** Queues one approved match. Queueing the same match twice is harmless. */
-export function queueMatch(matchId: number): { application: applications.Application; created: boolean } {
-    const match = getMatch(matchId);
+export async function queueMatch(matchId: number): Promise<{ application: applications.Application; created: boolean }> {
+    const match = await getMatch(matchId);
     if (!match) throw new NotFoundError("Match not found");
 
-    const account = getMailAccount(match.candidateId);
+    const account = await getMailAccount(match.candidateId);
     const [problem] = sendProblems(match, Boolean(account), account?.email);
     if (problem) throw new RuleError(problem);
 
@@ -140,15 +138,15 @@ export interface QueueResult {
 }
 
 /** Queues every approved match of a candidate that has an employer email. */
-export function queueApproved(candidateId: number, matchIds?: number[]): QueueResult {
+export async function queueApproved(candidateId: number, matchIds?: number[]): Promise<QueueResult> {
     const result: QueueResult = { queued: [], skipped: [] };
     const wanted = matchIds && new Set(matchIds);
 
-    for (const match of listMatches(candidateId, { status: "approved", limit: 200 })) {
+    for (const match of await listMatches(candidateId, { status: "approved", limit: 200 })) {
         if (wanted && !wanted.has(match.id)) continue;
 
         try {
-            const { application, created } = queueMatch(match.id);
+            const { application, created } = await queueMatch(match.id);
             if (created) result.queued.push(application);
             else result.skipped.push({ matchId: match.id, title: match.job.title, reason: `Already ${application.status}` });
         } catch (error) {
@@ -160,22 +158,22 @@ export function queueApproved(candidateId: number, matchIds?: number[]): QueueRe
     return result;
 }
 
-export function cancelApplication(id: number): applications.Application {
-    const application = applications.getApplication(id);
+export async function cancelApplication(id: number): Promise<applications.Application> {
+    const application = await applications.getApplication(id);
     if (!application) throw new NotFoundError("Application not found");
 
-    if (!applications.cancel(id, "Cancelled by you")) {
+    if (!(await applications.cancel(id, "Cancelled by you"))) {
         throw new RuleError(application.status === "sent" ? "This application has already been sent" : `Cannot cancel an application that is ${application.status}`);
     }
-    return applications.getApplication(id)!;
+    return (await applications.getApplication(id))!;
 }
 
-export function retryApplication(id: number): applications.Application {
-    const application = applications.getApplication(id);
+export async function retryApplication(id: number): Promise<applications.Application> {
+    const application = await applications.getApplication(id);
     if (!application) throw new NotFoundError("Application not found");
 
-    if (!applications.retry(id)) throw new RuleError(`Only failed applications can be retried; this one is ${application.status}`);
-    return applications.getApplication(id)!;
+    if (!(await applications.retry(id))) throw new RuleError(`Only failed applications can be retried; this one is ${application.status}`);
+    return (await applications.getApplication(id))!;
 }
 
 // ---- sending ---------------------------------------------------------------------------
@@ -188,44 +186,44 @@ export type ProcessResult = "idle" | "sent" | "deferred" | "failed" | "cancelled
  * repeatedly by the worker; safe to call concurrently because claiming a row is atomic.
  */
 export async function processNext(now = new Date()): Promise<ProcessResult> {
-    const due = applications.nextDue();
+    const due = await applications.nextDue();
     if (!due) return "idle";
 
     // Everything is re-checked at send time: the user may have rejected, edited or disconnected since queueing
-    const match = getMatch(due.matchId);
-    const account = getMailAccount(due.candidateId);
+    const match = await getMatch(due.matchId);
+    const account = await getMailAccount(due.candidateId);
     const problems = match ? sendProblems(match, Boolean(account), account?.email) : ["The match no longer exists"];
 
     if (problems.length > 0 || match?.job.applyEmail?.toLowerCase() !== due.toEmail) {
-        applications.cancel(due.id, problems[0] ?? "The employer address changed after you queued this application");
+        await applications.cancel(due.id, problems[0] ?? "The employer address changed after you queued this application");
         return "cancelled";
     }
 
-    const sentToday = applications.countSentSince(due.candidateId, new Date(now.getTime() - DAY_MS));
+    const sentToday = await applications.countSentSince(due.candidateId, new Date(now.getTime() - DAY_MS));
     if (sentToday >= DAILY_LIMIT()) {
-        applications.requeue(due.id, `Daily limit of ${DAILY_LIMIT()} applications reached; will continue tomorrow`, new Date(now.getTime() + 60 * 60_000));
+        await applications.requeue(due.id, `Daily limit of ${DAILY_LIMIT()} applications reached; will continue tomorrow`, new Date(now.getTime() + 60 * 60_000));
         return "deferred";
     }
 
-    const last = applications.lastSentAt(due.candidateId);
+    const last = await applications.lastSentAt(due.candidateId);
     if (last && now.getTime() - last.getTime() < MIN_GAP_MS()) {
-        applications.requeue(due.id, null, new Date(last.getTime() + MIN_GAP_MS()));
+        await applications.requeue(due.id, null, new Date(last.getTime() + MIN_GAP_MS()));
         return "deferred";
     }
 
     let settings;
     try {
-        settings = getSmtpSettings(due.candidateId)!;
+        settings = (await getSmtpSettings(due.candidateId))!;
     } catch (error) {
         // server configuration problem (MAIL_SECRET changed), not the application's fault
-        applications.requeue(due.id, error instanceof Error ? error.message : String(error), new Date(now.getTime() + 30 * 60_000));
+        await applications.requeue(due.id, error instanceof Error ? error.message : String(error), new Date(now.getTime() + 30 * 60_000));
         return "deferred";
     }
 
-    const claimed = applications.claim(due.id);
+    const claimed = await applications.claim(due.id);
     if (!claimed) return "idle"; // another worker got there first
 
-    const { mail } = prepare(match!, due.toEmail);
+    const { mail } = await prepare(match!, due.toEmail);
     let messageId: string;
     let transport;
 
@@ -236,11 +234,11 @@ export async function processNext(now = new Date()): Promise<ProcessResult> {
         const failure = classifySmtpError(error);
 
         if (failure.retryable && claimed.attempts < MAX_ATTEMPTS) {
-            applications.requeue(claimed.id, failure.message, new Date(Date.now() + RETRY_BACKOFF_MS * claimed.attempts));
+            await applications.requeue(claimed.id, failure.message, new Date(Date.now() + RETRY_BACKOFF_MS * claimed.attempts));
             return "deferred";
         }
 
-        applications.markFailed(claimed.id, failure.message);
+        await applications.markFailed(claimed.id, failure.message);
         return "failed";
     } finally {
         transport?.close();
@@ -248,6 +246,6 @@ export async function processNext(now = new Date()): Promise<ProcessResult> {
 
     // Outside the try block on purpose: once the server has accepted the mail, a bookkeeping
     // problem must never make it look like a failed send that could be retried (a duplicate).
-    applications.markSent(claimed.id, { messageId, subject: String(mail.subject), body: String(mail.text) });
+    await applications.markSent(claimed.id, { messageId, subject: String(mail.subject), body: String(mail.text) });
     return "sent";
 }

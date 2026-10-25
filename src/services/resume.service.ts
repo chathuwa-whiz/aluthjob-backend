@@ -32,7 +32,7 @@ export async function analyzeResume(
     // corrections the user made to the stored profile
     const hash = resumeKey(userId, resumeText, resume.links);
 
-    let candidate = findCandidateByHash(userId, hash);
+    let candidate = await findCandidateByHash(userId, hash);
     if (candidate) {
         report({ type: "reused" });
     } else {
@@ -40,7 +40,7 @@ export async function analyzeResume(
         const profile = await extractCandidateProfile(resume, report);
 
         report({ type: "phase", phase: "saving" });
-        candidate = createCandidate({ userId, hash, fileName: file.originalname, mimeType: file.mimetype, fileData: file.buffer, profile });
+        candidate = await createCandidate({ userId, hash, fileName: file.originalname, mimeType: file.mimetype, fileData: file.buffer, profile });
     }
 
     return {

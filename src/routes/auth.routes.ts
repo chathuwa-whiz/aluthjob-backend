@@ -44,8 +44,8 @@ router.post("/register", async (req, res) => {
 });
 
 // POST, not GET: mail scanners and link previews fetch every link in a message, which would use up a one-time token
-router.post("/verify-email", (req, res) => {
-    auth.verifyEmail(z.object({ token: LinkToken }).parse(req.body).token, contextOf(req));
+router.post("/verify-email", async (req, res) => {
+    await auth.verifyEmail(z.object({ token: LinkToken }).parse(req.body).token, contextOf(req));
     res.json({ success: true, data: { verified: true } });
 });
 
@@ -55,17 +55,17 @@ router.post("/login", async (req, res) => {
 });
 
 // Works without a valid session on purpose: signing out must always succeed and clear the cookie
-router.post("/logout", (req, res) => {
+router.post("/logout", async (req, res) => {
     const token = sessionTokenOf(req);
-    if (token) auth.logout(token);
+    if (token) await auth.logout(token);
 
     clearSessionCookie(res);
     res.json({ success: true, data: { signedOut: true } });
 });
 
 // "Forgot password": identical answer for known and unknown addresses
-router.post("/forgot-password", (req, res) => {
-    auth.requestPasswordReset(z.object({ email: Email }).parse(req.body).email, contextOf(req));
+router.post("/forgot-password", async (req, res) => {
+    await auth.requestPasswordReset(z.object({ email: Email }).parse(req.body).email, contextOf(req));
 
     res.status(202).json({ success: true, data: { message: "If that address has an account, we have sent a message to it with a link to choose a new password" } });
 });

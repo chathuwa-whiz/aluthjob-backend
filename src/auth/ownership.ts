@@ -13,26 +13,26 @@ const positive = (value: string | string[] | undefined) => {
     return Number.isInteger(id) && id > 0 ? id : undefined;
 };
 
-export function ownedCandidate(user: User, rawId: string | string[] | undefined): Candidate {
+export async function ownedCandidate(user: User, rawId: string | string[] | undefined): Promise<Candidate> {
     const id = positive(rawId);
-    const candidate = id === undefined ? undefined : getCandidate(id);
+    const candidate = id === undefined ? undefined : await getCandidate(id);
 
     if (!candidate || candidate.userId !== user.id) throw new NotFoundError("Candidate not found");
     return candidate;
 }
 
-export function ownedMatch(user: User, rawId: string | string[] | undefined): Match {
+export async function ownedMatch(user: User, rawId: string | string[] | undefined): Promise<Match> {
     const id = positive(rawId);
-    const match = id === undefined ? undefined : getMatch(id);
+    const match = id === undefined ? undefined : await getMatch(id);
 
-    if (!match || getCandidate(match.candidateId)?.userId !== user.id) throw new NotFoundError("Match not found");
+    if (!match || (await getCandidate(match.candidateId))?.userId !== user.id) throw new NotFoundError("Match not found");
     return match;
 }
 
-export function ownedApplication(user: User, rawId: string | string[] | undefined): Application {
+export async function ownedApplication(user: User, rawId: string | string[] | undefined): Promise<Application> {
     const id = positive(rawId);
-    const application = id === undefined ? undefined : getApplication(id);
+    const application = id === undefined ? undefined : await getApplication(id);
 
-    if (!application || getCandidate(application.candidateId)?.userId !== user.id) throw new NotFoundError("Application not found");
+    if (!application || (await getCandidate(application.candidateId))?.userId !== user.id) throw new NotFoundError("Application not found");
     return application;
 }

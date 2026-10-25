@@ -1,4 +1,4 @@
-import { getDatabase } from "../db/database.js";
+import { getDatabase, isUniqueViolation } from "../db/database.js";
 
 export type ApplicationStatus = "queued" | "sending" | "sent" | "failed" | "cancelled";
 
@@ -55,46 +55,56 @@ const toApplication = (row: ApplicationRow): Application => ({
 
 const db = () => getDatabase();
 const now = () => new Date().toISOString();
+/** The error column holds 4000 characters; a longer message must not make recording a failure fail. */
+const cut = (text: string | null, max: number) => (text === null ? null : text.slice(0, max));
 
-export function getApplication(id: number): Application | undefined {
-    const row = db().prepare("SELECT * FROM applications WHERE id = ?").get(id) as unknown as ApplicationRow | undefined;
+export async function getApplication(id: number): Promise<Application | undefined> {
+    const row = await db().get<ApplicationRow>("SELECT * FROM applications WHERE id = ?", [id]);
     return row && toApplication(row);
 }
 
-export function getApplicationByMatch(matchId: number): Application | undefined {
-    const row = db().prepare("SELECT * FROM applications WHERE match_id = ?").get(matchId) as unknown as ApplicationRow | undefined;
+export async function getApplicationByMatch(matchId: number): Promise<Application | undefined> {
+    const row = await db().get<ApplicationRow>("SELECT * FROM applications WHERE match_id = ?", [matchId]);
     return row && toApplication(row);
 }
 
-export function listApplications(candidateId: number, status?: ApplicationStatus): Application[] {
-    const rows = db()
-        .prepare(`SELECT * FROM applications WHERE candidate_id = ? ${status ? "AND status = ?" : ""} ORDER BY id DESC LIMIT 200`)
-        .all(...(status ? [candidateId, status] : [candidateId])) as unknown as ApplicationRow[];
+export async function listApplications(candidateId: number, status?: ApplicationStatus): Promise<Application[]> {
+    const rows = await db().all<ApplicationRow>(
+        `SELECT * FROM applications WHERE candidate_id = ? ${status ? "AND status = ?" : ""} ORDER BY id DESC FETCH FIRST 200 ROWS ONLY`,
+        status ? [candidateId, status] : [candidateId],
+    );
 
     return rows.map(toApplication);
 }
 
 /** Puts a match in the queue. The UNIQUE(match_id) constraint makes queueing idempotent. */
-export function enqueue(matchId: number, candidateId: number, toEmail: string): { application: Application; created: boolean } {
-    const existing = getApplicationByMatch(matchId);
+export async function enqueue(matchId: number, candidateId: number, toEmail: string): Promise<{ application: Application; created: boolean }> {
+    const existing = await getApplicationByMatch(matchId);
     if (existing) return { application: existing, created: false };
 
     const at = now();
-    const result = db()
-        .prepare(`
-            INSERT INTO applications (match_id, candidate_id, to_email, status, next_attempt_at, queued_at, updated_at)
-            VALUES (?, ?, ?, 'queued', ?, ?, ?)
-        `)
-        .run(matchId, candidateId, toEmail, at, at, at);
+    try {
+        const id = await db().insert(
+            `INSERT INTO applications (match_id, candidate_id, to_email, status, next_attempt_at, queued_at, updated_at)
+             VALUES (?, ?, ?, 'queued', ?, ?, ?)`,
+            [matchId, candidateId, toEmail, at, at, at],
+        );
 
-    return { application: getApplication(Number(result.lastInsertRowid))!, created: true };
+        return { application: (await getApplication(id))!, created: true };
+    } catch (error) {
+        // two requests queued the same match at once; the loser gets the winner's row
+        const raced = isUniqueViolation(error) ? await getApplicationByMatch(matchId) : undefined;
+        if (raced) return { application: raced, created: false };
+        throw error;
+    }
 }
 
 /** The next queued application that is due, oldest first. */
-export function nextDue(): Application | undefined {
-    const row = db()
-        .prepare("SELECT * FROM applications WHERE status = 'queued' AND next_attempt_at <= ? ORDER BY next_attempt_at, id LIMIT 1")
-        .get(now()) as unknown as ApplicationRow | undefined;
+export async function nextDue(): Promise<Application | undefined> {
+    const row = await db().get<ApplicationRow>(
+        "SELECT * FROM applications WHERE status = 'queued' AND next_attempt_at <= ? ORDER BY next_attempt_at, id FETCH FIRST 1 ROWS ONLY",
+        [now()],
+    );
 
     return row && toApplication(row);
 }
@@ -103,68 +113,54 @@ export function nextDue(): Application | undefined {
  * Atomically takes an application for sending. The conditional UPDATE means that even two
  * workers racing for the same row cannot both win, so no message is ever sent twice.
  */
-export function claim(id: number): Application | undefined {
-    const result = db()
-        .prepare("UPDATE applications SET status = 'sending', attempts = attempts + 1, updated_at = ? WHERE id = ? AND status = 'queued'")
-        .run(now(), id);
+export async function claim(id: number): Promise<Application | undefined> {
+    const result = await db().run("UPDATE applications SET status = 'sending', attempts = attempts + 1, updated_at = ? WHERE id = ? AND status = 'queued'", [now(), id]);
 
     return result.changes === 1 ? getApplication(id) : undefined;
 }
 
-export function markSent(id: number, details: { messageId: string; subject: string; body: string }): void {
+export async function markSent(id: number, details: { messageId: string; subject: string; body: string }): Promise<void> {
     const at = now();
-    db()
-        .prepare(`
-            UPDATE applications
-            SET status = 'sent', error = NULL, message_id = ?, sent_subject = ?, sent_body = ?, sent_at = ?, updated_at = ?
-            WHERE id = ?
-        `)
-        .run(details.messageId, details.subject, details.body, at, at, id);
+    await db().run(
+        `UPDATE applications
+         SET status = 'sent', error = NULL, message_id = ?, sent_subject = ?, sent_body = ?, sent_at = ?, updated_at = ?
+         WHERE id = ?`,
+        [cut(details.messageId, 500), cut(details.subject, 1000), details.body, at, at, id],
+    );
 }
 
-export function markFailed(id: number, error: string): void {
-    db().prepare("UPDATE applications SET status = 'failed', error = ?, updated_at = ? WHERE id = ?").run(error, now(), id);
+export async function markFailed(id: number, error: string): Promise<void> {
+    await db().run("UPDATE applications SET status = 'failed', error = ?, updated_at = ? WHERE id = ?", [cut(error, 4000), now(), id]);
 }
 
-export function requeue(id: number, error: string | null, notBefore: Date): void {
-    db()
-        .prepare("UPDATE applications SET status = 'queued', error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?")
-        .run(error, notBefore.toISOString(), now(), id);
+export async function requeue(id: number, error: string | null, notBefore: Date): Promise<void> {
+    await db().run("UPDATE applications SET status = 'queued', error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?", [cut(error, 4000), notBefore.toISOString(), now(), id]);
 }
 
 /** Only queued applications can be cancelled; once sending has started it cannot be taken back. */
-export function cancel(id: number, reason: string | null = null): boolean {
-    return (
-        db()
-            .prepare("UPDATE applications SET status = 'cancelled', error = ?, updated_at = ? WHERE id = ? AND status = 'queued'")
-            .run(reason, now(), id).changes === 1
-    );
+export async function cancel(id: number, reason: string | null = null): Promise<boolean> {
+    return (await db().run("UPDATE applications SET status = 'cancelled', error = ?, updated_at = ? WHERE id = ? AND status = 'queued'", [cut(reason, 4000), now(), id])).changes === 1;
 }
 
 /** A user-requested retry of a failed application. */
-export function retry(id: number): boolean {
+export async function retry(id: number): Promise<boolean> {
+    const at = now();
     return (
-        db()
-            .prepare("UPDATE applications SET status = 'queued', error = NULL, attempts = 0, next_attempt_at = ?, updated_at = ? WHERE id = ? AND status = 'failed'")
-            .run(now(), now(), id).changes === 1
-    );
+        await db().run("UPDATE applications SET status = 'queued', error = NULL, attempts = 0, next_attempt_at = ?, updated_at = ? WHERE id = ? AND status = 'failed'", [at, at, id])
+    ).changes === 1;
 }
 
 /** Messages sent (or being sent) for a candidate since the given time; drives the daily limit. */
-export function countSentSince(candidateId: number, since: Date): number {
-    const row = db()
-        .prepare("SELECT COUNT(*) AS n FROM applications WHERE candidate_id = ? AND status IN ('sent', 'sending') AND updated_at >= ?")
-        .get(candidateId, since.toISOString()) as unknown as { n: number };
+export async function countSentSince(candidateId: number, since: Date): Promise<number> {
+    const row = await db().get<{ n: number }>("SELECT COUNT(*) AS n FROM applications WHERE candidate_id = ? AND status IN ('sent', 'sending') AND updated_at >= ?", [candidateId, since.toISOString()]);
 
-    return row.n;
+    return row!.n;
 }
 
-export function lastSentAt(candidateId: number): Date | undefined {
-    const row = db()
-        .prepare("SELECT MAX(updated_at) AS at FROM applications WHERE candidate_id = ? AND status IN ('sent', 'sending')")
-        .get(candidateId) as unknown as { at: string | null };
+export async function lastSentAt(candidateId: number): Promise<Date | undefined> {
+    const row = await db().get<{ latest: string | null }>("SELECT MAX(updated_at) AS latest FROM applications WHERE candidate_id = ? AND status IN ('sent', 'sending')", [candidateId]);
 
-    return row.at ? new Date(row.at) : undefined;
+    return row?.latest ? new Date(row.latest) : undefined;
 }
 
 /**
@@ -172,8 +168,11 @@ export function lastSentAt(candidateId: number): Date | undefined {
  * left the building. It is never retried automatically: the user is told to check the Sent
  * folder and can retry by hand.
  */
-export function failInterrupted(): number {
-    return db()
-        .prepare("UPDATE applications SET status = 'failed', error = ?, updated_at = ? WHERE status = 'sending'")
-        .run("Interrupted while sending. Check the Sent folder of your mailbox before retrying, to avoid a duplicate.", now()).changes as number;
+export async function failInterrupted(): Promise<number> {
+    return (
+        await db().run("UPDATE applications SET status = 'failed', error = ?, updated_at = ? WHERE status = 'sending'", [
+            "Interrupted while sending. Check the Sent folder of your mailbox before retrying, to avoid a duplicate.",
+            now(),
+        ])
+    ).changes;
 }

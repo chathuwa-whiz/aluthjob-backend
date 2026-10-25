@@ -1,5 +1,5 @@
-import { getDatabase } from "../db/database.js";
-import { getJob, type StoredJob } from "../jobs/job.repository.js";
+import { getDatabase, isUniqueViolation } from "../db/database.js";
+import { getJob, getJobsByIds, type StoredJob } from "../jobs/job.repository.js";
 import type { MatchScore } from "./scoring.js";
 
 export type MatchStatus = "suggested" | "approved" | "rejected";
@@ -69,49 +69,56 @@ export interface NewMatch {
     details: MatchDetails;
 }
 
+/** Oracle accepts at most 1000 items in an IN list. */
+const CHUNK = 500;
+
 /**
  * Stores the outcome of a matching run. Scores and explanations are refreshed, but a user's
  * decision and any drafted letter survive. Suggestions the user never touched that no longer
  * qualify are dropped, so the list always reflects the latest run.
  */
-export function saveMatches(candidateId: number, matches: NewMatch[]): void {
-    const db = getDatabase();
+export async function saveMatches(candidateId: number, matches: NewMatch[]): Promise<void> {
     const now = new Date().toISOString();
 
-    const upsert = db.prepare(`
-        INSERT INTO matches (candidate_id, job_id, score, details_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT (candidate_id, job_id) DO UPDATE SET
-            score = excluded.score, details_json = excluded.details_json, updated_at = excluded.updated_at
-    `);
+    await getDatabase().transaction(async (tx) => {
+        const keep = new Set(matches.map((match) => match.jobId));
+        const untouched = await tx.all<{ job_id: number }>(
+            "SELECT job_id FROM matches WHERE candidate_id = ? AND status = 'suggested' AND cover_letter IS NULL",
+            [candidateId],
+        );
+        const stale = untouched.map((row) => row.job_id).filter((jobId) => !keep.has(jobId));
 
-    db.exec("BEGIN");
-    try {
-        if (matches.length === 0) {
-            db.prepare("DELETE FROM matches WHERE candidate_id = ? AND status = 'suggested' AND cover_letter IS NULL").run(candidateId);
-        } else {
-            const keep = matches.map(() => "?").join(",");
-            db.prepare(`
-                DELETE FROM matches
-                WHERE candidate_id = ? AND status = 'suggested' AND cover_letter IS NULL AND job_id NOT IN (${keep})
-            `).run(candidateId, ...matches.map((match) => match.jobId));
+        for (let i = 0; i < stale.length; i += CHUNK) {
+            const part = stale.slice(i, i + CHUNK);
+            await tx.run(`DELETE FROM matches WHERE candidate_id = ? AND job_id IN (${part.map(() => "?").join(",")})`, [candidateId, ...part]);
         }
 
         for (const match of matches) {
-            upsert.run(candidateId, match.jobId, match.score, JSON.stringify(match.details), now, now);
+            const details = JSON.stringify(match.details);
+            const refresh = () =>
+                tx.run("UPDATE matches SET score = ?, details_json = ?, updated_at = ? WHERE candidate_id = ? AND job_id = ?", [match.score, details, now, candidateId, match.jobId]);
+
+            if ((await refresh()).changes === 0) {
+                try {
+                    await tx.run(
+                        "INSERT INTO matches (candidate_id, job_id, score, details_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        [candidateId, match.jobId, match.score, details, now, now],
+                    );
+                } catch (error) {
+                    // two searches of the same CV at once: the other one inserted it first (its commit is what released us)
+                    if (!isUniqueViolation(error)) throw error;
+                    await refresh();
+                }
+            }
         }
-        db.exec("COMMIT");
-    } catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-    }
+    });
 }
 
-export function getMatch(id: number): Match | undefined {
-    const row = getDatabase().prepare("SELECT * FROM matches WHERE id = ?").get(id) as unknown as MatchRow | undefined;
+export async function getMatch(id: number): Promise<Match | undefined> {
+    const row = await getDatabase().get<MatchRow>("SELECT * FROM matches WHERE id = ?", [id]);
     if (!row) return undefined;
 
-    const job = getJob(row.job_id);
+    const job = await getJob(row.job_id);
     return job && toMatch(row, job);
 }
 
@@ -122,7 +129,7 @@ export interface MatchFilter {
     offset?: number;
 }
 
-export function listMatches(candidateId: number, filter: MatchFilter = {}): Match[] {
+export async function listMatches(candidateId: number, filter: MatchFilter = {}): Promise<Match[]> {
     const where = ["candidate_id = :candidateId"];
     const params: Record<string, string | number> = { candidateId };
 
@@ -135,45 +142,42 @@ export function listMatches(candidateId: number, filter: MatchFilter = {}): Matc
         params.minScore = filter.minScore;
     }
 
-    const rows = getDatabase()
-        .prepare(`
-            SELECT * FROM matches WHERE ${where.join(" AND ")}
-            ORDER BY score DESC, id ASC LIMIT :limit OFFSET :offset
-        `)
-        .all({ ...params, limit: filter.limit ?? 50, offset: filter.offset ?? 0 }) as unknown as MatchRow[];
+    const rows = await getDatabase().all<MatchRow>(
+        `SELECT * FROM matches WHERE ${where.join(" AND ")}
+         ORDER BY score DESC, id ASC OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY`,
+        { ...params, lim: filter.limit ?? 50, off: filter.offset ?? 0 },
+    );
+
+    // one query for all the vacancies, not one per match: every round trip to a cloud database costs time
+    const jobs = await getJobsByIds(rows.map((row) => row.job_id));
 
     return rows.flatMap((row) => {
-        const job = getJob(row.job_id);
+        const job = jobs.get(row.job_id);
         return job ? [toMatch(row, job)] : [];
     });
 }
 
-export function saveDraft(id: number, subject: string, coverLetter: string): void {
+export async function saveDraft(id: number, subject: string, coverLetter: string): Promise<void> {
     const now = new Date().toISOString();
 
     // A new draft must be looked at again, so any earlier approval is withdrawn
-    getDatabase()
-        .prepare(`
-            UPDATE matches
-            SET subject = ?, cover_letter = ?, drafted_at = ?, updated_at = ?,
-                status = CASE WHEN status = 'approved' THEN 'suggested' ELSE status END,
-                decided_at = CASE WHEN status = 'approved' THEN NULL ELSE decided_at END
-            WHERE id = ?
-        `)
-        .run(subject, coverLetter, now, now, id);
+    await getDatabase().run(
+        `UPDATE matches
+         SET subject = ?, cover_letter = ?, drafted_at = ?, updated_at = ?,
+             status = CASE WHEN status = 'approved' THEN 'suggested' ELSE status END,
+             decided_at = CASE WHEN status = 'approved' THEN NULL ELSE decided_at END
+         WHERE id = ?`,
+        [subject, coverLetter, now, now, id],
+    );
 }
 
-export function setStatus(id: number, status: MatchStatus): void {
+export async function setStatus(id: number, status: MatchStatus): Promise<void> {
     const now = new Date().toISOString();
 
-    getDatabase()
-        .prepare("UPDATE matches SET status = ?, decided_at = ?, updated_at = ? WHERE id = ?")
-        .run(status, status === "suggested" ? null : now, now, id);
+    await getDatabase().run("UPDATE matches SET status = ?, decided_at = ?, updated_at = ? WHERE id = ?", [status, status === "suggested" ? null : now, now, id]);
 }
 
 /** Records that the user checked this address against the original advert. */
-export function saveConfirmedEmail(id: number, address: string): void {
-    getDatabase()
-        .prepare("UPDATE matches SET confirmed_email = ?, updated_at = ? WHERE id = ?")
-        .run(address.toLowerCase(), new Date().toISOString(), id);
+export async function saveConfirmedEmail(id: number, address: string): Promise<void> {
+    await getDatabase().run("UPDATE matches SET confirmed_email = ?, updated_at = ? WHERE id = ?", [address.toLowerCase(), new Date().toISOString(), id]);
 }

@@ -1,4 +1,4 @@
-import { getDatabase } from "../db/database.js";
+import { getDatabase, isUniqueViolation } from "../db/database.js";
 import { decryptSecret, encryptSecret } from "./secret-box.js";
 import type { SmtpSettings } from "./smtp.js";
 
@@ -37,37 +37,48 @@ const toAccount = (row: MailAccountRow): MailAccount => ({
     verifiedAt: row.verified_at,
 });
 
-const selectRow = (candidateId: number) =>
-    getDatabase().prepare("SELECT * FROM mail_accounts WHERE candidate_id = ?").get(candidateId) as unknown as MailAccountRow | undefined;
+const selectRow = (candidateId: number) => getDatabase().get<MailAccountRow>("SELECT * FROM mail_accounts WHERE candidate_id = ?", [candidateId]);
 
-export function saveMailAccount(input: Omit<MailAccount, "verifiedAt"> & { password: string }): MailAccount {
+export async function saveMailAccount(input: Omit<MailAccount, "verifiedAt"> & { password: string }): Promise<MailAccount> {
     const now = new Date().toISOString();
 
-    getDatabase()
-        .prepare(`
-            INSERT INTO mail_accounts (candidate_id, email, from_name, host, port, secure, username, password_enc, verified_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (candidate_id) DO UPDATE SET
-                email = excluded.email, from_name = excluded.from_name, host = excluded.host, port = excluded.port,
-                secure = excluded.secure, username = excluded.username, password_enc = excluded.password_enc,
-                verified_at = excluded.verified_at, updated_at = excluded.updated_at
-        `)
-        .run(
-            input.candidateId, input.email, input.fromName, input.host, input.port, input.secure ? 1 : 0,
-            input.username, encryptSecret(input.password), now, now, now,
+    await getDatabase().transaction(async (tx) => {
+        const saved = await tx.run(
+            `UPDATE mail_accounts
+             SET email = ?, from_name = ?, host = ?, port = ?, secure = ?, username = ?, password_enc = ?, verified_at = ?, updated_at = ?
+             WHERE candidate_id = ?`,
+            [input.email, input.fromName, input.host, input.port, input.secure ? 1 : 0, input.username, encryptSecret(input.password), now, now, input.candidateId],
         );
 
-    return getMailAccount(input.candidateId)!;
+        if (saved.changes === 0) {
+            try {
+                await tx.run(
+                    `INSERT INTO mail_accounts (candidate_id, email, from_name, host, port, secure, username, password_enc, verified_at, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [input.candidateId, input.email, input.fromName, input.host, input.port, input.secure ? 1 : 0, input.username, encryptSecret(input.password), now, now, now],
+                );
+            } catch (error) {
+                // saved twice at once: the other request inserted the row first, so this one only updates it
+                if (!isUniqueViolation(error)) throw error;
+                await tx.run(
+                    "UPDATE mail_accounts SET email = ?, from_name = ?, host = ?, port = ?, secure = ?, username = ?, password_enc = ?, verified_at = ?, updated_at = ? WHERE candidate_id = ?",
+                    [input.email, input.fromName, input.host, input.port, input.secure ? 1 : 0, input.username, encryptSecret(input.password), now, now, input.candidateId],
+                );
+            }
+        }
+    });
+
+    return (await getMailAccount(input.candidateId))!;
 }
 
-export function getMailAccount(candidateId: number): MailAccount | undefined {
-    const row = selectRow(candidateId);
+export async function getMailAccount(candidateId: number): Promise<MailAccount | undefined> {
+    const row = await selectRow(candidateId);
     return row && toAccount(row);
 }
 
 /** The only place a decrypted password leaves storage; used right before connecting. */
-export function getSmtpSettings(candidateId: number): (SmtpSettings & { email: string; fromName: string | null }) | undefined {
-    const row = selectRow(candidateId);
+export async function getSmtpSettings(candidateId: number): Promise<(SmtpSettings & { email: string; fromName: string | null }) | undefined> {
+    const row = await selectRow(candidateId);
     if (!row) return undefined;
 
     return {
@@ -81,6 +92,6 @@ export function getSmtpSettings(candidateId: number): (SmtpSettings & { email: s
     };
 }
 
-export function deleteMailAccount(candidateId: number): boolean {
-    return getDatabase().prepare("DELETE FROM mail_accounts WHERE candidate_id = ?").run(candidateId).changes > 0;
+export async function deleteMailAccount(candidateId: number): Promise<boolean> {
+    return (await getDatabase().run("DELETE FROM mail_accounts WHERE candidate_id = ?", [candidateId])).changes > 0;
 }

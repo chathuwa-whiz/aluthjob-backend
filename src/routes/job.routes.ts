@@ -17,19 +17,19 @@ const ListQuery = z.object({
     offset: z.coerce.number().int().min(0).default(0),
 });
 
-router.get("/", (req, res) => {
+router.get("/", async (req, res) => {
     const query = ListQuery.safeParse(req.query);
     if (!query.success) return res.status(400).json({ success: false, message: z.prettifyError(query.error) });
 
     const { hasEmail, openOnly, source, ...rest } = query.data;
-    const jobs = listJobs({
+    const jobs = await listJobs({
         ...rest,
         ...(source && { source: source as (typeof sourceIds)[number] }),
         hasEmail: hasEmail === "true",
         openOnly: openOnly === "true",
     });
 
-    res.json({ success: true, data: jobs, counts: countJobsBySource() });
+    res.json({ success: true, data: jobs, counts: await countJobsBySource() });
 });
 
 router.get("/:id", async (req, res, next) => {
@@ -38,7 +38,7 @@ router.get("/:id", async (req, res, next) => {
         if (!Number.isInteger(id)) return res.status(400).json({ success: false, message: "Invalid job id" });
 
         // Detail pages are fetched lazily, the first time a vacancy is opened
-        const job = (await enrichJob(id)) ?? getJob(id);
+        const job = (await enrichJob(id)) ?? (await getJob(id));
         if (!job) return res.status(404).json({ success: false, message: "Job not found" });
 
         res.json({ success: true, data: job });

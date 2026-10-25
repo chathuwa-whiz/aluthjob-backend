@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
 
 // Configuration must be in place before the modules under test are loaded
-process.env.DATABASE_PATH = ":memory:";
+import { clearDatabase } from "../db/test-helpers.js";
 process.env.AUTH_SCRYPT_COST = "1024"; // fast hashing for tests; production uses 32768
 process.env.MAIL_SECRET = "test-secret-".repeat(4);
 process.env.FRONTEND_URL = "http://localhost:3000";
@@ -156,11 +156,11 @@ describe("registration and sessions", () => {
         assert.ok(!/password|hash|scrypt/i.test(raw), "no credential material in the response");
         assert.ok(!raw.includes(PASSWORD));
 
-        const stored = m.users.findUserWithHash("new.user@example.com");
+        const stored = await m.users.findUserWithHash("new.user@example.com");
         assert.ok(stored, "emails are normalised");
         assert.equal(stored.role, "user");
         assert.equal(stored.emailVerified, false);
-        assert.equal((m.db.getDatabase().prepare("SELECT COUNT(*) AS n FROM sessions").get() as { n: number }).n, 0);
+        assert.equal((await m.db.getDatabase().get<{ n: number }>("SELECT COUNT(*) AS n FROM sessions"))!.n, 0);
     });
 
     it("sets an HttpOnly, SameSite cookie when the user signs in", async () => {
@@ -212,7 +212,7 @@ describe("registration and sessions", () => {
 
     it("stores only a hash of the session token", async () => {
         const { cookie } = await signUp("hashed@example.com");
-        const rows = m.db.getDatabase().prepare("SELECT token_hash FROM sessions").all() as { token_hash: string }[];
+        const rows = await m.db.getDatabase().all<{ token_hash: string }>("SELECT token_hash FROM sessions");
 
         assert.ok(rows.length >= 1);
         assert.ok(rows.every((row) => row.token_hash !== tokenOf(cookie) && !row.token_hash.includes(tokenOf(cookie))));
@@ -229,7 +229,7 @@ describe("registration and sessions", () => {
         assert.deepEqual(again.json, first.json, "the page cannot tell a new address from a taken one");
         assert.equal(again.setCookie.length, 0);
 
-        assert.equal((m.db.getDatabase().prepare("SELECT COUNT(*) AS n FROM users WHERE email = ?").get("dup@example.com") as { n: number }).n, 1);
+        assert.equal((await m.db.getDatabase().get<{ n: number }>("SELECT COUNT(*) AS n FROM users WHERE email = ?", ["dup@example.com"]))!.n, 1);
 
         const [notice] = await mailsTo("dup@example.com");
         assert.match(notice!.subject, /Someone tried to sign up/);
@@ -251,7 +251,7 @@ describe("registration and sessions", () => {
             assert.equal(response.status, 409, password);
             assert.match(response.json.message, message, password);
         }
-        assert.equal(m.users.findUserWithHash("weakname@example.com"), undefined);
+        assert.equal(await m.users.findUserWithHash("weakname@example.com"), undefined);
     });
 
     it("rejects malformed input and bad JSON without crashing", async () => {
@@ -277,11 +277,11 @@ describe("registration and sessions", () => {
 
     it("rejects expired sessions and purges them", async () => {
         const { cookie } = await signUp("expired@example.com");
-        m.db.getDatabase().prepare("UPDATE sessions SET expires_at = ?").run(new Date(Date.now() - 1000).toISOString());
+        await m.db.getDatabase().run("UPDATE sessions SET expires_at = ?", [new Date(Date.now() - 1000).toISOString()]);
 
         assert.equal((await request("GET", "/auth/me", { cookie })).status, 401);
-        assert.ok(m.authService.purgeExpiredSessions() >= 1);
-        assert.equal((m.db.getDatabase().prepare("SELECT COUNT(*) AS n FROM sessions").get() as { n: number }).n, 0);
+        assert.ok(await m.authService.purgeExpiredSessions() >= 1);
+        assert.equal((await m.db.getDatabase().get<{ n: number }>("SELECT COUNT(*) AS n FROM sessions"))!.n, 0);
     });
 });
 
@@ -366,20 +366,20 @@ describe("account management", () => {
 
     it("deletes the account and everything stored for it", async () => {
         const user = await signUp("gone@example.com");
-        const ids = seed(user.id, "gone");
+        const ids = await seed(user.id, "gone");
 
         assert.equal((await request("DELETE", "/auth/account", { cookie: user.cookie, body: { password: "not my password" } })).status, 401);
-        assert.ok(m.candidates.getCandidate(ids.candidateId), "a wrong password deletes nothing");
+        assert.ok(await m.candidates.getCandidate(ids.candidateId), "a wrong password deletes nothing");
 
         const deleted = await request("DELETE", "/auth/account", { cookie: user.cookie, body: { password: PASSWORD } });
         assert.equal(deleted.status, 200);
 
-        const count = (table: string) => (m.db.getDatabase().prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
-        assert.equal(m.candidates.getCandidate(ids.candidateId), undefined);
-        assert.equal(m.matches.getMatch(ids.matchId), undefined);
-        assert.equal(m.apps.getApplication(ids.applicationId), undefined);
-        assert.equal(m.mailboxes.getMailAccount(ids.candidateId), undefined);
-        assert.equal(count("sessions") >= 0 && (m.db.getDatabase().prepare("SELECT COUNT(*) AS n FROM sessions WHERE user_id = ?").get(user.id) as { n: number }).n, 0);
+        const count = async (table: string) => (await m.db.getDatabase().get<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`))!.n;
+        assert.equal(await m.candidates.getCandidate(ids.candidateId), undefined);
+        assert.equal(await m.matches.getMatch(ids.matchId), undefined);
+        assert.equal(await m.apps.getApplication(ids.applicationId), undefined);
+        assert.equal(await m.mailboxes.getMailAccount(ids.candidateId), undefined);
+        assert.equal((await count("sessions")) >= 0 && (await m.db.getDatabase().get<{ n: number }>("SELECT COUNT(*) AS n FROM sessions WHERE user_id = ?", [user.id]))!.n, 0);
 
         assert.equal((await request("GET", "/auth/me", { cookie: user.cookie })).status, 401);
         assert.equal((await request("POST", "/auth/login", { body: { email: "gone@example.com", password: PASSWORD } })).status, 401);
@@ -388,14 +388,14 @@ describe("account management", () => {
     it("deleting one account leaves everyone else's data untouched", async () => {
         const leaving = await signUp("leaving@example.com");
         const staying = await signUp("staying@example.com");
-        seed(leaving.id, "leaving");
-        const kept = seed(staying.id, "staying");
+        await seed(leaving.id, "leaving");
+        const kept = await seed(staying.id, "staying");
 
         await request("DELETE", "/auth/account", { cookie: leaving.cookie, body: { password: PASSWORD } });
 
-        assert.ok(m.candidates.getCandidate(kept.candidateId));
-        assert.ok(m.matches.getMatch(kept.matchId));
-        assert.ok(m.apps.getApplication(kept.applicationId));
+        assert.ok(await m.candidates.getCandidate(kept.candidateId));
+        assert.ok(await m.matches.getMatch(kept.matchId));
+        assert.ok(await m.apps.getApplication(kept.applicationId));
     });
 });
 
@@ -497,8 +497,8 @@ describe("default deny", () => {
 
 // ---- isolation between users -----------------------------------------------------------
 
-function seed(userId: number, tag: string) {
-    const candidate = m.candidates.createCandidate({
+async function seed(userId: number, tag: string) {
+    const candidate = await m.candidates.createCandidate({
         userId, hash: `hash-${tag}`, fileName: `${tag}-cv.pdf`, mimeType: "application/pdf", fileData: CV,
         profile: {
             personalInfo: { fullName: `Person ${tag}`, email: `${tag}@example.com`, phone: null, location: "Colombo, Sri Lanka", linkedin: null, portfolio: null },
@@ -506,19 +506,19 @@ function seed(userId: number, tag: string) {
         },
     });
 
-    m.jobs.upsertJobs([{
+    await m.jobs.upsertJobs([{
         source: "xpress", externalId: `job-${tag}`, url: `https://example.test/${tag}`, title: `Engineer ${tag}`, company: "Employer", location: "Colombo",
         description: null, jobType: null, salary: null, category: null, postedAt: null, closingAt: null, applyEmail: `hr-${tag}@employer.test`, applyUrl: null,
     }]);
-    const job = m.jobs.listJobs({ search: `Engineer ${tag}`, limit: 1 })[0]!;
+    const job = (await m.jobs.listJobs({ search: `Engineer ${tag}`, limit: 1 }))[0]!;
 
-    m.matches.saveMatches(candidate.id, [{ jobId: job.id, score: 80, details: { breakdown: { skills: 1, title: 1, content: 1, experience: 1, location: 1 }, matchedSkills: [], reasons: [], warnings: [] } }]);
-    const match = m.matches.listMatches(candidate.id)[0]!;
-    m.matches.saveDraft(match.id, `Application ${tag}`, `Dear Hiring Manager,\n\nLetter of ${tag}.\n\nSincerely,\n${tag}`);
-    m.matches.setStatus(match.id, "approved");
+    await m.matches.saveMatches(candidate.id, [{ jobId: job.id, score: 80, details: { breakdown: { skills: 1, title: 1, content: 1, experience: 1, location: 1 }, matchedSkills: [], reasons: [], warnings: [] } }]);
+    const match = (await m.matches.listMatches(candidate.id))[0]!;
+    await m.matches.saveDraft(match.id, `Application ${tag}`, `Dear Hiring Manager,\n\nLetter of ${tag}.\n\nSincerely,\n${tag}`);
+    await m.matches.setStatus(match.id, "approved");
 
-    m.mailboxes.saveMailAccount({ candidateId: candidate.id, email: `${tag}@example.com`, fromName: null, host: "127.0.0.1", port: 2525, secure: false, username: tag, password: "mailbox-password" });
-    const application = m.apps.enqueue(match.id, candidate.id, `hr-${tag}@employer.test`).application;
+    await m.mailboxes.saveMailAccount({ candidateId: candidate.id, email: `${tag}@example.com`, fromName: null, host: "127.0.0.1", port: 2525, secure: false, username: tag, password: "mailbox-password" });
+    const application = (await m.apps.enqueue(match.id, candidate.id, `hr-${tag}@employer.test`)).application;
 
     return { candidateId: candidate.id, jobId: job.id, matchId: match.id, applicationId: application.id };
 }
@@ -526,15 +526,15 @@ function seed(userId: number, tag: string) {
 describe("isolation between users", () => {
     let alice: Awaited<ReturnType<typeof signUp>>;
     let bob: Awaited<ReturnType<typeof signUp>>;
-    let a: ReturnType<typeof seed>;
-    let b: ReturnType<typeof seed>;
+    let a: Awaited<ReturnType<typeof seed>>;
+    let b: Awaited<ReturnType<typeof seed>>;
 
     beforeEach(async () => {
-        m.db.getDatabase().exec("DELETE FROM applications; DELETE FROM matches; DELETE FROM mail_accounts; DELETE FROM candidates; DELETE FROM jobs; DELETE FROM sessions; DELETE FROM users;");
+        await clearDatabase();
         alice = await signUp("alice@example.com");
         bob = await signUp("bob@example.com");
-        a = seed(alice.id, "alice");
-        b = seed(bob.id, "bob");
+        a = await seed(alice.id, "alice");
+        b = await seed(bob.id, "bob");
     });
 
     it("lets each user see their own data", async () => {
@@ -590,10 +590,10 @@ describe("isolation between users", () => {
 
     it("changes nothing of Alice's, whatever Bob attempts", async () => {
         const before = JSON.stringify({
-            candidate: m.candidates.getCandidate(a.candidateId),
-            match: m.matches.getMatch(a.matchId),
-            application: m.apps.getApplication(a.applicationId),
-            mailbox: m.mailboxes.getMailAccount(a.candidateId),
+            candidate: await m.candidates.getCandidate(a.candidateId),
+            match: await m.matches.getMatch(a.matchId),
+            application: await m.apps.getApplication(a.applicationId),
+            mailbox: await m.mailboxes.getMailAccount(a.candidateId),
         });
 
         const profile = { personalInfo: { fullName: "Hijacked", email: null, phone: null, location: null, linkedin: null, portfolio: null }, skills: [], education: [], experience: [], certifications: [], achievements: [] };
@@ -606,10 +606,10 @@ describe("isolation between users", () => {
         await request("POST", `/candidates/${a.candidateId}/applications/queue`, { cookie: bob.cookie, body: {} });
 
         const after = JSON.stringify({
-            candidate: m.candidates.getCandidate(a.candidateId),
-            match: m.matches.getMatch(a.matchId),
-            application: m.apps.getApplication(a.applicationId),
-            mailbox: m.mailboxes.getMailAccount(a.candidateId),
+            candidate: await m.candidates.getCandidate(a.candidateId),
+            match: await m.matches.getMatch(a.matchId),
+            application: await m.apps.getApplication(a.applicationId),
+            mailbox: await m.mailboxes.getMailAccount(a.candidateId),
         });
         assert.equal(after, before);
     });
@@ -628,7 +628,7 @@ describe("isolation between users", () => {
 
         assert.equal(response.status, 202);
         assert.deepEqual(response.json.data.queued, []);
-        assert.equal(m.apps.getApplicationByMatch(a.matchId)!.candidateId, a.candidateId);
+        assert.equal((await m.apps.getApplicationByMatch(a.matchId))!.candidateId, a.candidateId);
     });
 
     it("never lets one user's session act as another", async () => {
@@ -638,7 +638,7 @@ describe("isolation between users", () => {
     });
 
     it("keeps ownerless (pre-accounts) resumes out of everyone's reach", async () => {
-        m.db.getDatabase().prepare("UPDATE candidates SET user_id = NULL WHERE id = ?").run(a.candidateId);
+        await m.db.getDatabase().run("UPDATE candidates SET user_id = NULL WHERE id = ?", [a.candidateId]);
 
         assert.equal((await request("GET", `/candidates/${a.candidateId}`, { cookie: alice.cookie })).status, 404);
         assert.equal((await request("GET", `/candidates/${a.candidateId}/resume`, { cookie: bob.cookie })).status, 404);
@@ -663,7 +663,7 @@ describe("administrators", () => {
         const response = await request("POST", "/auth/register", { body: { email: "sneaky@example.com", password: PASSWORD, role: "admin", isAdmin: true } });
 
         assert.equal(response.status, 202);
-        assert.equal(m.users.findUserWithHash("sneaky@example.com")!.role, "user");
+        assert.equal((await m.users.findUserWithHash("sneaky@example.com"))!.role, "user");
     });
 
     it("lets requireAdmin pass only administrators", () => {
@@ -746,18 +746,18 @@ describe("resume ownership key", () => {
         assert.notEqual(m.resume.resumeKey(1, "ab", []), m.resume.resumeKey(11, "b", []), "no ambiguity between user id and text");
     });
 
-    it("never hands user A's record to user B who uploads the same file", () => {
-        m.db.getDatabase().exec("DELETE FROM candidates; DELETE FROM users;");
-        const ua = m.users.createUser("ra@example.com", "x")!;
-        const ub = m.users.createUser("rb@example.com", "x")!;
+    it("never hands user A's record to user B who uploads the same file", async () => {
+        await clearDatabase();
+        const ua = (await m.users.createUser("ra@example.com", "x"))!;
+        const ub = (await m.users.createUser("rb@example.com", "x"))!;
         const profile = seed_profile();
 
         const keyA = m.resume.resumeKey(ua.id, "identical cv", []);
-        m.candidates.createCandidate({ userId: ua.id, hash: keyA, fileName: "cv.pdf", mimeType: "application/pdf", fileData: CV, profile });
+        await m.candidates.createCandidate({ userId: ua.id, hash: keyA, fileName: "cv.pdf", mimeType: "application/pdf", fileData: CV, profile });
 
-        assert.ok(m.candidates.findCandidateByHash(ua.id, keyA));
-        assert.equal(m.candidates.findCandidateByHash(ub.id, m.resume.resumeKey(ub.id, "identical cv", [])), undefined);
-        assert.equal(m.candidates.findCandidateByHash(ub.id, keyA), undefined, "even knowing A's key does not find it");
+        assert.ok(await m.candidates.findCandidateByHash(ua.id, keyA));
+        assert.equal(await m.candidates.findCandidateByHash(ub.id, m.resume.resumeKey(ub.id, "identical cv", [])), undefined);
+        assert.equal(await m.candidates.findCandidateByHash(ub.id, keyA), undefined, "even knowing A's key does not find it");
     });
 });
 

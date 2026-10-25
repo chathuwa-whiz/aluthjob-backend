@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, it } from "node:test";
 
 // Configuration must be in place before the modules under test are loaded
-process.env.DATABASE_PATH = ":memory:";
+import { clearDatabase } from "../db/test-helpers.js";
 
 type Mods = {
     db: typeof import("../db/database.js");
@@ -87,10 +87,10 @@ before(async () => {
     originalChat = (m.ollama.ollama as unknown as { chat: unknown }).chat;
 });
 
-beforeEach(() => {
+beforeEach(async () => {
     m.tracker.forgetAnalyses();
-    m.db.getDatabase().exec("DELETE FROM matches; DELETE FROM jobs; DELETE FROM candidates; DELETE FROM users;");
-    userId = m.users.createUser("a@example.test", "x")!.id;
+    await clearDatabase();
+    userId = (await m.users.createUser("a@example.test", "x"))!.id;
 });
 
 after(() => {
@@ -171,7 +171,7 @@ describe("following a CV being read", () => {
 
     it("keeps each person's CV separate", async () => {
         fakeModel();
-        const other = m.users.createUser("b@example.test", "x")!.id;
+        const other = (await m.users.createUser("b@example.test", "x"))!.id;
         m.tracker.startAnalysis(userId, file(cv()));
         await finished();
 

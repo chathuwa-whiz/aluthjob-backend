@@ -46,9 +46,9 @@ export const limits = {
 export const normalizeEmail = (email: string) => email.trim().toLowerCase();
 const hashToken = (token: string) => createHash("sha256").update(token).digest("hex");
 
-function issueSession(userId: number, context: RequestContext): string {
+async function issueSession(userId: number, context: RequestContext): Promise<string> {
     const token = randomBytes(32).toString("base64url");
-    users.createSession(userId, hashToken(token), new Date(Date.now() + sessionMs()), context.userAgent);
+    await users.createSession(userId, hashToken(token), new Date(Date.now() + sessionMs()), context.userAgent);
     return token;
 }
 
@@ -58,12 +58,13 @@ const pendingMail = new Set<Promise<void>>();
 
 /**
  * Sends without making the caller wait. This matters for security, not speed: if a request for an address
- * that has an account took longer (it sends a mail) than one for an address that has none, the response
- * time would reveal which addresses are registered. Failures are logged, never shown to the caller.
+ * that has an account took longer (it writes a token and sends a mail) than one for an address that has none,
+ * the response time would reveal which addresses are registered. So the whole job, including the database
+ * write that creates the link, runs after the answer is out. Failures are logged, never shown to the caller.
  */
-function sendInBackground(mail: OutgoingMail): void {
-    const sending = (async () => getSystemMailer().send(mail))()
-        .catch((error: unknown) => console.error(`Could not send "${mail.subject}":`, error instanceof Error ? error.message : error))
+function sendInBackground(prepare: () => Promise<OutgoingMail>): void {
+    const sending = (async () => getSystemMailer().send(await prepare()))()
+        .catch((error: unknown) => console.error("Could not send an account email:", error instanceof Error ? error.message : error))
         .finally(() => pendingMail.delete(sending));
 
     pendingMail.add(sending);
@@ -100,21 +101,21 @@ export async function register(emailInput: string, password: string, context: Re
     assertAcceptablePassword(password, email);
 
     // hashed even when the address turns out to be taken, so both outcomes cost the same time
-    const user = users.createUser(email, await hashPassword(password));
+    const user = await users.createUser(email, await hashPassword(password));
 
     if (user) {
-        sendInBackground(verificationMessage(email, issueEmailToken(user.id, "verify", email, VERIFY_HOURS * HOUR), VERIFY_HOURS));
+        sendInBackground(async () => verificationMessage(email, await issueEmailToken(user.id, "verify", email, VERIFY_HOURS * HOUR), VERIFY_HOURS));
     } else if (mayMail(email)) {
-        sendInBackground(alreadyRegisteredMessage(email));
+        sendInBackground(async () => alreadyRegisteredMessage(email));
     }
 }
 
 /** Confirms an address from the emailed link. Single use. Does not sign anyone in. */
-export function verifyEmail(token: string, context: RequestContext): void {
+export async function verifyEmail(token: string, context: RequestContext): Promise<void> {
     limits.badLinkPerAddress.assertAllowed(context.ip);
 
-    const used = consumeEmailToken("verify", token);
-    const user = used && users.getUser(used.userId);
+    const used = await consumeEmailToken("verify", token);
+    const user = used && (await users.getUser(used.userId));
 
     // a link only counts for the address it was sent to
     if (!used || !user || user.email !== used.email) {
@@ -122,8 +123,8 @@ export function verifyEmail(token: string, context: RequestContext): void {
         throw new BadRequestError("This confirmation link is invalid or has expired. Sign in and ask for a new one");
     }
 
-    users.markEmailVerified(user.id);
-    revokeEmailTokens(user.id, "verify");
+    await users.markEmailVerified(user.id);
+    await revokeEmailTokens(user.id, "verify");
 }
 
 /** A signed-in but unverified user asking for a fresh link (the old one stops working). */
@@ -134,7 +135,7 @@ export function resendVerification(user: users.User): void {
     limits.resendPerUser.assertAllowed(String(user.id));
     limits.resendPerUser.record(String(user.id));
 
-    sendInBackground(verificationMessage(user.email, issueEmailToken(user.id, "verify", user.email, VERIFY_HOURS * HOUR), VERIFY_HOURS));
+    sendInBackground(async () => verificationMessage(user.email, await issueEmailToken(user.id, "verify", user.email, VERIFY_HOURS * HOUR), VERIFY_HOURS));
 }
 
 // ---- sign in and out -------------------------------------------------------------------
@@ -146,7 +147,7 @@ export async function login(emailInput: string, password: string, context: Reque
     limits.loginPerAccount.assertAllowed(accountKey);
     limits.loginPerAddress.assertAllowed(context.ip);
 
-    const found = users.findUserWithHash(email);
+    const found = await users.findUserWithHash(email);
     // Always do the expensive comparison, even for an unknown address, so timing does not reveal which emails have accounts
     const correct = await verifyPassword(password, found?.passwordHash ?? (await decoyHash()));
 
@@ -157,10 +158,10 @@ export async function login(emailInput: string, password: string, context: Reque
     }
 
     limits.loginPerAccount.clear(accountKey);
-    users.touchLogin(found.id);
+    await users.touchLogin(found.id);
 
     const { passwordHash: _passwordHash, ...user } = found;
-    return { user, token: issueSession(found.id, context) };
+    return { user, token: await issueSession(found.id, context) };
 }
 
 export const logout = (token: string) => users.deleteSession(hashToken(token));
@@ -173,7 +174,7 @@ export const authenticate = (token: string) => users.findSessionUser(hashToken(t
 async function confirmPassword(userId: number, password: string): Promise<void> {
     limits.sensitivePerUser.assertAllowed(String(userId));
 
-    const stored = users.getPasswordHash(userId);
+    const stored = await users.getPasswordHash(userId);
     if (!stored || !(await verifyPassword(password, stored))) {
         limits.sensitivePerUser.record(String(userId));
         throw new UnauthorizedError("Incorrect password");
@@ -187,28 +188,28 @@ export async function changePassword(user: users.User, current: string, next: st
     await confirmPassword(user.id, current);
     assertAcceptablePassword(next, user.email);
 
-    users.setPasswordHash(user.id, await hashPassword(next));
-    users.deleteSessionsOf(user.id, hashToken(currentToken));
-    revokeEmailTokens(user.id, "reset");
+    await users.setPasswordHash(user.id, await hashPassword(next));
+    await users.deleteSessionsOf(user.id, hashToken(currentToken));
+    await revokeEmailTokens(user.id, "reset");
 
     // so the owner hears about it even if someone else did this with a hijacked session
-    sendInBackground(passwordChangedMessage(user.email, "change"));
+    sendInBackground(async () => passwordChangedMessage(user.email, "change"));
 }
 
 /**
  * "Forgot password". Always answers the same way, whether or not the address has an account, and never
  * waits for the email to be sent, so neither the response nor its timing says who is registered.
  */
-export function requestPasswordReset(emailInput: string, context: RequestContext): void {
+export async function requestPasswordReset(emailInput: string, context: RequestContext): Promise<void> {
     assertSystemMailAvailable();
     limits.forgotPerAddress.assertAllowed(context.ip);
     limits.forgotPerAddress.record(context.ip);
 
     const email = normalizeEmail(emailInput);
-    const user = users.findUserWithHash(email);
+    const user = await users.findUserWithHash(email);
 
     if (user && mayMail(email)) {
-        sendInBackground(passwordResetMessage(email, issueEmailToken(user.id, "reset", email, RESET_MINUTES * MINUTE), RESET_MINUTES));
+        sendInBackground(async () => passwordResetMessage(email, await issueEmailToken(user.id, "reset", email, RESET_MINUTES * MINUTE), RESET_MINUTES));
     }
 }
 
@@ -225,29 +226,29 @@ export async function resetPassword(token: string, newPassword: string, context:
         return new BadRequestError("This reset link is invalid or has expired. Request a new one");
     };
 
-    const pending = peekEmailToken("reset", token);
+    const pending = await peekEmailToken("reset", token);
     if (!pending) throw invalid();
 
     // checked before the link is spent: a too-weak password must not cost the user their only link
     assertAcceptablePassword(newPassword, pending.email);
     const hash = await hashPassword(newPassword);
 
-    const used = consumeEmailToken("reset", token);
-    const user = used && users.getUser(used.userId);
+    const used = await consumeEmailToken("reset", token);
+    const user = used && (await users.getUser(used.userId));
     if (!used || !user || user.email !== used.email) throw invalid();
 
-    users.setPasswordHash(user.id, hash);
-    users.markEmailVerified(user.id);
-    users.deleteSessionsOf(user.id);
-    revokeEmailTokens(user.id, "reset");
+    await users.setPasswordHash(user.id, hash);
+    await users.markEmailVerified(user.id);
+    await users.deleteSessionsOf(user.id);
+    await revokeEmailTokens(user.id, "reset");
 
-    sendInBackground(passwordChangedMessage(user.email, "reset"));
+    sendInBackground(async () => passwordChangedMessage(user.email, "reset"));
 }
 
 /** Permanently removes the account and every resume, match, mailbox and application that belongs to it. */
 export async function deleteAccount(user: users.User, password: string): Promise<void> {
     await confirmPassword(user.id, password);
-    users.deleteUser(user.id);
+    await users.deleteUser(user.id);
 }
 
 export const purgeExpiredSessions = users.purgeExpiredSessions;

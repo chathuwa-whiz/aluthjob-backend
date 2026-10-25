@@ -23,7 +23,7 @@ async function main() {
         console.log(await enrichPending(id, limit));
     }
 
-    console.log("Stored per source:", countJobsBySource());
+    console.log("Stored per source:", await countJobsBySource());
     await shutdownOcr();
 }
 

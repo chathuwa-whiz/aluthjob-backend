@@ -44,9 +44,9 @@ export function sessionTokenOf(req: Request): string | undefined {
 }
 
 /** Rejects the request unless it carries a live session. Mounted once, in front of every route that is not public. */
-export const requireAuth: RequestHandler = (req, _res, next) => {
+export const requireAuth: RequestHandler = async (req, _res, next) => {
     const token = sessionTokenOf(req);
-    const user = token ? authenticate(token) : undefined;
+    const user = token ? await authenticate(token) : undefined;
     if (!token || !user) throw new UnauthorizedError("Sign in to continue");
 
     req.user = user;

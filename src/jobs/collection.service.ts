@@ -8,12 +8,9 @@ export interface StoreStatus {
     lastCollectedAt: string | null;
 }
 
-export function jobStoreStatus(): StoreStatus {
-    const row = getDatabase().prepare("SELECT COUNT(*) AS total, MAX(last_seen_at) AS last FROM jobs").get() as unknown as {
-        total: number;
-        last: string | null;
-    };
-    return { total: row.total, lastCollectedAt: row.last };
+export async function jobStoreStatus(): Promise<StoreStatus> {
+    const row = (await getDatabase().get<{ total: number; latest: string | null }>("SELECT COUNT(*) AS total, MAX(last_seen_at) AS latest FROM jobs"))!;
+    return { total: row.total, lastCollectedAt: row.latest };
 }
 
 /** Vacancies older than this are refreshed in the background before the next search. */
@@ -81,7 +78,7 @@ export interface CollectionReport {
  * - Vacancies exist but are old: search what is there right away and refresh in the background.
  */
 export async function ensureVacancies(onSite?: SiteListener): Promise<CollectionReport> {
-    const status = jobStoreStatus();
+    const status = await jobStoreStatus();
 
     if (status.total > 0) {
         if (isStale(status)) {
@@ -103,7 +100,7 @@ export async function ensureVacancies(onSite?: SiteListener): Promise<Collection
         sourcesFailed: results.filter((result) => result.error).length,
     };
 
-    if (jobStoreStatus().total === 0) {
+    if ((await jobStoreStatus()).total === 0) {
         const reasons = [...new Set(results.flatMap((result) => (result.error ? [result.error] : [])))].slice(0, 2).join("; ");
         throw new RuleError(
             `We could not collect any vacancies from the job sites just now${reasons ? ` (${reasons})` : ""}. ` +

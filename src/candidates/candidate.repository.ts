@@ -32,74 +32,61 @@ const toCandidate = (row: CandidateRow): Candidate => ({
     updatedAt: row.updated_at,
 });
 
-/** Looked up per owner: two accounts uploading the same file must never end up sharing a record. */
-export function findCandidateByHash(userId: number, hash: string): Candidate | undefined {
-    const row = getDatabase()
-        .prepare("SELECT id, user_id, file_name, mime_type, profile_json, created_at, updated_at FROM candidates WHERE user_id = ? AND resume_hash = ?")
-        .get(userId, hash) as unknown as CandidateRow | undefined;
+// the resume file itself (file_data) is left out: it can be large and is read only when attaching it
+const COLUMNS = "id, user_id, file_name, mime_type, profile_json, created_at, updated_at";
 
+/** Looked up per owner: two accounts uploading the same file must never end up sharing a record. */
+export async function findCandidateByHash(userId: number, hash: string): Promise<Candidate | undefined> {
+    const row = await getDatabase().get<CandidateRow>(`SELECT ${COLUMNS} FROM candidates WHERE user_id = ? AND resume_hash = ?`, [userId, hash]);
     return row && toCandidate(row);
 }
 
-export function createCandidate(input: {
+export async function createCandidate(input: {
     userId: number;
     hash: string;
     fileName: string;
     mimeType: string;
     fileData: Buffer;
     profile: Resume;
-}): Candidate {
-    const db = getDatabase();
+}): Promise<Candidate> {
     const now = new Date().toISOString();
 
-    const result = db
-        .prepare(`
-            INSERT INTO candidates (user_id, resume_hash, file_name, mime_type, file_data, profile_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `)
-        .run(input.userId, input.hash, input.fileName, input.mimeType, input.fileData, JSON.stringify(input.profile), now, now);
+    const id = await getDatabase().insert(
+        `INSERT INTO candidates (user_id, resume_hash, file_name, mime_type, file_data, profile_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [input.userId, input.hash, input.fileName, input.mimeType, input.fileData, JSON.stringify(input.profile), now, now],
+    );
 
-    return getCandidate(Number(result.lastInsertRowid))!;
+    return (await getCandidate(id))!;
 }
 
-export function getCandidate(id: number): Candidate | undefined {
-    const row = getDatabase()
-        .prepare("SELECT id, user_id, file_name, mime_type, profile_json, created_at, updated_at FROM candidates WHERE id = ?")
-        .get(id) as unknown as CandidateRow | undefined;
-
+export async function getCandidate(id: number): Promise<Candidate | undefined> {
+    const row = await getDatabase().get<CandidateRow>(`SELECT ${COLUMNS} FROM candidates WHERE id = ?`, [id]);
     return row && toCandidate(row);
 }
 
 /** The profile is machine-extracted, so users can correct it; matching reads the corrected version. */
-export function updateCandidateProfile(id: number, profile: Resume): Candidate | undefined {
-    getDatabase()
-        .prepare("UPDATE candidates SET profile_json = ?, updated_at = ? WHERE id = ?")
-        .run(JSON.stringify(profile), new Date().toISOString(), id);
+export async function updateCandidateProfile(id: number, profile: Resume): Promise<Candidate | undefined> {
+    await getDatabase().run("UPDATE candidates SET profile_json = ?, updated_at = ? WHERE id = ?", [JSON.stringify(profile), new Date().toISOString(), id]);
 
     return getCandidate(id);
 }
 
-export function getCandidateFile(id: number): { fileName: string; mimeType: string; data: Buffer } | undefined {
-    const row = getDatabase()
-        .prepare("SELECT file_name, mime_type, file_data FROM candidates WHERE id = ?")
-        .get(id) as unknown as { file_name: string; mime_type: string; file_data: Uint8Array } | undefined;
+export async function getCandidateFile(id: number): Promise<{ fileName: string; mimeType: string; data: Buffer } | undefined> {
+    const row = await getDatabase().get<{ file_name: string; mime_type: string; file_data: Buffer }>(
+        "SELECT file_name, mime_type, file_data FROM candidates WHERE id = ?",
+        [id],
+    );
 
     return row && { fileName: row.file_name, mimeType: row.mime_type, data: Buffer.from(row.file_data) };
 }
 
-export function listCandidatesOf(userId: number): Candidate[] {
-    const rows = getDatabase()
-        .prepare("SELECT id, user_id, file_name, mime_type, profile_json, created_at, updated_at FROM candidates WHERE user_id = ? ORDER BY id DESC")
-        .all(userId) as unknown as CandidateRow[];
-
+export async function listCandidatesOf(userId: number): Promise<Candidate[]> {
+    const rows = await getDatabase().all<CandidateRow>(`SELECT ${COLUMNS} FROM candidates WHERE user_id = ? ORDER BY id DESC`, [userId]);
     return rows.map(toCandidate);
 }
 
 /** Gives an ownerless (pre-accounts) resume to a user. Used by the `assign-candidate` script, never by the API. */
-export function assignCandidateOwner(candidateId: number, userId: number): boolean {
-    return (
-        getDatabase()
-            .prepare("UPDATE candidates SET user_id = ? WHERE id = ? AND user_id IS NULL")
-            .run(userId, candidateId).changes === 1
-    );
+export async function assignCandidateOwner(candidateId: number, userId: number): Promise<boolean> {
+    return (await getDatabase().run("UPDATE candidates SET user_id = ? WHERE id = ? AND user_id IS NULL", [userId, candidateId])).changes === 1;
 }

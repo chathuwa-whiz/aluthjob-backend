@@ -27,7 +27,7 @@ export async function ingestSource(id: JobSourceId, maxPages = DEFAULT_MAX_PAGES
 
     try {
         const jobs = await sources[id].fetchListings({ maxPages, onProgress: (found) => report?.({ source: id, state: "reading", fetched: found }) });
-        const { inserted, updated } = upsertJobs(jobs);
+        const { inserted, updated } = await upsertJobs(jobs);
 
         report?.({ source: id, state: "done", fetched: jobs.length });
         return { source: id, fetched: jobs.length, inserted, updated };
@@ -46,13 +46,13 @@ export async function ingestAll(ids: JobSourceId[] = sourceIds, maxPages = DEFAU
 
 /** Loads the detail page of one stored vacancy (description, apply email) if not done yet. */
 export async function enrichJob(id: number) {
-    const job = getJob(id);
+    const job = await getJob(id);
     if (!job) return undefined;
 
     const source = sources[job.source];
     if (!source.enrich || job.enrichedAt) return job;
 
-    saveEnrichment(id, await source.enrich(job));
+    await saveEnrichment(id, await source.enrich(job));
     return getJob(id);
 }
 
@@ -73,14 +73,14 @@ export async function enrichPending(id: JobSourceId, limit: number): Promise<Enr
     const source = sources[id];
     if (!source.enrich) return result;
 
-    for (const job of listUnenriched(id, limit)) {
+    for (const job of await listUnenriched(id, limit)) {
         result.attempted++;
 
         try {
-            saveEnrichment(job.id, await source.enrich(job));
+            await saveEnrichment(job.id, await source.enrich(job));
             result.enriched++;
         } catch (error) {
-            recordEnrichmentFailure(job.id);
+            await recordEnrichmentFailure(job.id).catch(() => {});
             result.failed++;
             console.warn(`Could not read advert ${job.id} (${id}):`, error instanceof Error ? error.message : error);
         }

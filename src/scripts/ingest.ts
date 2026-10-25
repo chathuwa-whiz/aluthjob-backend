@@ -19,7 +19,7 @@ async function main() {
     const results = await ingestAll(requested.length ? requested : sourceIds, pages);
 
     console.table(results);
-    console.log("Stored per source:", countJobsBySource());
+    console.log("Stored per source:", await countJobsBySource());
     process.exit(results.every((result) => result.error) ? 1 : 0);
 }
 

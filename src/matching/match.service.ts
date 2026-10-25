@@ -59,7 +59,7 @@ export async function runMatching(
 ): Promise<MatchRunSummary> {
     const options = { ...DEFAULT_RUN_OPTIONS, ...overrides };
 
-    const candidate = getCandidate(candidateId);
+    const candidate = await getCandidate(candidateId);
     if (!candidate) throw new NotFoundError("Candidate not found");
 
     // A fresh install has no vacancies yet: collect them now rather than "searching" nothing
@@ -70,7 +70,7 @@ export async function runMatching(
 
     const seenSince = new Date(Date.now() - STALE_AFTER_DAYS * 864e5).toISOString();
     const jobs = new Map<number, StoredJob>(
-        listJobs({ openOnly: true, seenSince, limit: 100_000 }).map((job) => [job.id, job]),
+        (await listJobs({ openOnly: true, seenSince, limit: 100_000 })).map((job) => [job.id, job]),
     );
 
     const model = buildProfileModel(candidate.profile);
@@ -109,12 +109,12 @@ export async function runMatching(
         .slice(0, options.limit)
         .map(({ job, result: { score, ...details } }) => ({ jobId: job.id, score, details }));
 
-    saveMatches(candidateId, selected);
+    await saveMatches(candidateId, selected);
     report({ type: "matched", matched: selected.length, topScore: selected[0]?.score ?? null });
 
     let drafted = 0;
     if (options.draftTop > 0) {
-        const toDraft = listMatches(candidateId, { limit: options.draftTop }).filter((match) => !match.coverLetter);
+        const toDraft = (await listMatches(candidateId, { limit: options.draftTop })).filter((match) => !match.coverLetter);
         if (toDraft.length > 0) report({ type: "phase", phase: "drafting" });
 
         for (const [index, match] of toDraft.entries()) {
@@ -137,35 +137,35 @@ export async function runMatching(
 
 /** (Re)writes the cover letter of a suggestion. Any earlier approval is withdrawn by the repository. */
 export async function writeCoverLetter(matchId: number): Promise<Match> {
-    const match = getMatch(matchId);
+    const match = await getMatch(matchId);
     if (!match) throw new NotFoundError("Match not found");
 
-    const candidate = getCandidate(match.candidateId);
+    const candidate = await getCandidate(match.candidateId);
     if (!candidate) throw new NotFoundError("Candidate not found");
 
     const letter = await draftCoverLetter(candidate.profile, match.job, match.details.matchedSkills);
-    saveDraft(matchId, letter.subject, letter.text);
+    await saveDraft(matchId, letter.subject, letter.text);
 
-    return getMatch(matchId)!;
+    return (await getMatch(matchId))!;
 }
 
-export function editCoverLetter(matchId: number, edits: { subject?: string; coverLetter?: string }): Match {
-    const match = getMatch(matchId);
+export async function editCoverLetter(matchId: number, edits: { subject?: string; coverLetter?: string }): Promise<Match> {
+    const match = await getMatch(matchId);
     if (!match) throw new NotFoundError("Match not found");
 
-    const candidate = getCandidate(match.candidateId);
-    saveDraft(
+    const candidate = await getCandidate(match.candidateId);
+    await saveDraft(
         matchId,
         edits.subject ?? match.subject ?? (candidate ? buildSubject(candidate.profile, match.job) : match.job.title),
         edits.coverLetter ?? match.coverLetter ?? "",
     );
 
-    return getMatch(matchId)!;
+    return (await getMatch(matchId))!;
 }
 
 /** The user's confirmation. Nothing is ever sent for a match that has not been approved. */
-export function approveMatch(matchId: number): Match {
-    const match = getMatch(matchId);
+export async function approveMatch(matchId: number): Promise<Match> {
+    const match = await getMatch(matchId);
     if (!match) throw new NotFoundError("Match not found");
 
     if (!match.coverLetter?.trim()) throw new RuleError("Write or generate a cover letter before approving");
@@ -173,23 +173,23 @@ export function approveMatch(matchId: number): Match {
         throw new RuleError("This vacancy has already closed");
     }
 
-    setStatus(matchId, "approved");
-    return getMatch(matchId)!;
+    await setStatus(matchId, "approved");
+    return (await getMatch(matchId))!;
 }
 
-export function rejectMatch(matchId: number): Match {
-    if (!getMatch(matchId)) throw new NotFoundError("Match not found");
+export async function rejectMatch(matchId: number): Promise<Match> {
+    if (!(await getMatch(matchId))) throw new NotFoundError("Match not found");
 
-    setStatus(matchId, "rejected");
-    return getMatch(matchId)!;
+    await setStatus(matchId, "rejected");
+    return (await getMatch(matchId))!;
 }
 
 /**
  * For addresses that were read from a picture: the user types the address back after looking at the
  * original advert. Typing it (not just clicking OK) is what catches a misread character.
  */
-export function confirmAddress(matchId: number, address: string): Match {
-    const match = getMatch(matchId);
+export async function confirmAddress(matchId: number, address: string): Promise<Match> {
+    const match = await getMatch(matchId);
     if (!match) throw new NotFoundError("Match not found");
     if (!match.job.applyEmail) throw new RuleError("This vacancy has no employer address to confirm");
 
@@ -197,6 +197,6 @@ export function confirmAddress(matchId: number, address: string): Match {
         throw new RuleError("That does not match the address on file. Check the original advert and type the address exactly as printed there");
     }
 
-    saveConfirmedEmail(matchId, match.job.applyEmail);
-    return getMatch(matchId)!;
+    await saveConfirmedEmail(matchId, match.job.applyEmail);
+    return (await getMatch(matchId))!;
 }

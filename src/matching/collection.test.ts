@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { before, beforeEach, describe, it } from "node:test";
 
 // Configuration must be in place before the modules under test are loaded
-process.env.DATABASE_PATH = ":memory:";
+import { clearDatabase } from "../db/test-helpers.js";
 delete process.env.COLLECTION_MAX_AGE_HOURS;
 
 type Mods = {
@@ -33,7 +33,7 @@ function fakeCollector(count: number, options: { failedSites?: number; delayMs?:
     m.collection.setCollector(async () => {
         state.calls++;
         if (options.delayMs) await new Promise((resolve) => setTimeout(resolve, options.delayMs));
-        m.jobs.upsertJobs(Array.from({ length: count }, (_, index) => posting(index + 1)));
+        await m.jobs.upsertJobs(Array.from({ length: count }, (_, index) => posting(index + 1)));
         return results(count, options.failedSites);
     });
     return state;
@@ -50,10 +50,10 @@ before(async () => {
     };
 });
 
-beforeEach(() => {
-    m.db.getDatabase().exec("DELETE FROM matches; DELETE FROM jobs; DELETE FROM candidates; DELETE FROM users;");
-    const user = m.users.createUser("a@example.test", "x")!;
-    candidateId = m.candidates.createCandidate({
+beforeEach(async () => {
+    await clearDatabase();
+    const user = (await m.users.createUser("a@example.test", "x"))!;
+    candidateId = (await m.candidates.createCandidate({
         userId: user.id, hash: "h", fileName: "cv.pdf", mimeType: "application/pdf", fileData: Buffer.from("cv"),
         profile: {
             personalInfo: { fullName: "Ama", email: null, phone: null, location: "Colombo, Sri Lanka", linkedin: null, portfolio: null },
@@ -61,7 +61,7 @@ beforeEach(() => {
             education: [], experience: [{ company: "Webminds", position: "Full Stack Developer", startDate: "2023-01", endDate: "Present", responsibilities: ["Built React apps"] }],
             certifications: [], achievements: [],
         },
-    }).id;
+    })).id;
 });
 
 const search = () => m.matching.runMatching(candidateId, { enrichTop: 0 });
@@ -91,7 +91,7 @@ describe("a first search on an empty store", () => {
         m.collection.setCollector(async () => results(0, 3));
 
         await assert.rejects(search(), /could not collect any vacancies.*fetch failed.*reach the internet/s);
-        assert.equal((m.db.getDatabase().prepare("SELECT COUNT(*) AS n FROM matches").get() as { n: number }).n, 0);
+        assert.equal((await m.db.getDatabase().get<{ n: number }>("SELECT COUNT(*) AS n FROM matches"))!.n, 0);
     });
 
     it("lets two people searching at once share one collection instead of reading every site twice", async () => {
@@ -114,7 +114,7 @@ describe("a first search on an empty store", () => {
 
 describe("a search when vacancies already exist", () => {
     it("does not collect when the data is fresh", async () => {
-        m.jobs.upsertJobs([posting(1), posting(2)]);
+        await m.jobs.upsertJobs([posting(1), posting(2)]);
         const collector = fakeCollector(9);
 
         const summary = await search();
@@ -125,8 +125,8 @@ describe("a search when vacancies already exist", () => {
     });
 
     it("searches stale data straight away and refreshes it in the background", async () => {
-        m.jobs.upsertJobs([posting(1), posting(2)]);
-        m.db.getDatabase().prepare("UPDATE jobs SET last_seen_at = ?").run(new Date(Date.now() - 3 * 864e5).toISOString());
+        await m.jobs.upsertJobs([posting(1), posting(2)]);
+        await m.db.getDatabase().run("UPDATE jobs SET last_seen_at = ?", [new Date(Date.now() - 3 * 864e5).toISOString()]);
         const collector = fakeCollector(9, { delayMs: 300 }); // slow: the search must not wait for it
 
         const started = Date.now();
@@ -159,10 +159,10 @@ describe("staleness", () => {
         }
     });
 
-    it("reads the store's status from the database", () => {
-        assert.deepEqual(m.collection.jobStoreStatus(), { total: 0, lastCollectedAt: null });
-        m.jobs.upsertJobs([posting(1)]);
-        const status = m.collection.jobStoreStatus();
+    it("reads the store's status from the database", async () => {
+        assert.deepEqual(await m.collection.jobStoreStatus(), { total: 0, lastCollectedAt: null });
+        await m.jobs.upsertJobs([posting(1)]);
+        const status = await m.collection.jobStoreStatus();
         assert.equal(status.total, 1);
         assert.ok(status.lastCollectedAt);
     });

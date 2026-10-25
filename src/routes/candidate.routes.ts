@@ -31,8 +31,8 @@ const ListQuery = z.object({
 });
 
 // The signed-in user's resumes
-router.get("/", (req, res) => {
-    const candidates = listCandidatesOf(currentUser(req).id).map((candidate) => ({
+router.get("/", async (req, res) => {
+    const candidates = (await listCandidatesOf(currentUser(req).id)).map((candidate) => ({
         id: candidate.id,
         fileName: candidate.fileName,
         fullName: candidate.profile.personalInfo.fullName,
@@ -43,20 +43,20 @@ router.get("/", (req, res) => {
     res.json({ success: true, data: candidates });
 });
 
-router.get("/:id", (req, res) => {
-    res.json({ success: true, data: ownedCandidate(currentUser(req), req.params.id) });
+router.get("/:id", async (req, res) => {
+    res.json({ success: true, data: await ownedCandidate(currentUser(req), req.params.id) });
 });
 
 // The profile is extracted by a small model and can be wrong; matching uses whatever is stored here
-router.put("/:id/profile", (req, res) => {
-    const candidate = ownedCandidate(currentUser(req), req.params.id);
+router.put("/:id/profile", async (req, res) => {
+    const candidate = await ownedCandidate(currentUser(req), req.params.id);
 
-    res.json({ success: true, data: updateCandidateProfile(candidate.id, ResumeSchema.parse(req.body)) });
+    res.json({ success: true, data: await updateCandidateProfile(candidate.id, ResumeSchema.parse(req.body)) });
 });
 
-router.get("/:id/resume", (req, res) => {
-    const candidate = ownedCandidate(currentUser(req), req.params.id);
-    const file = getCandidateFile(candidate.id);
+router.get("/:id/resume", async (req, res) => {
+    const candidate = await ownedCandidate(currentUser(req), req.params.id);
+    const file = await getCandidateFile(candidate.id);
     if (!file) throw new NotFoundError("Candidate not found");
 
     // A CV is personal data: it must not be cached by shared proxies, and the browser must not guess its type
@@ -66,15 +66,15 @@ router.get("/:id/resume", (req, res) => {
 
 // The search takes minutes (it reads job sites and adverts), so it runs in the background: this answers at once
 // with its progress, and the screen follows it with GET.
-router.post("/:id/matches/run", (req, res) => {
-    const candidate = ownedCandidate(currentUser(req), req.params.id);
+router.post("/:id/matches/run", async (req, res) => {
+    const candidate = await ownedCandidate(currentUser(req), req.params.id);
 
     res.status(202).json({ success: true, data: startRun(candidate.id, RunBody.parse(req.body ?? {})) });
 });
 
 // The latest search of this CV (null when none has run since the server started)
-router.get("/:id/matches/run", (req, res) => {
-    const candidate = ownedCandidate(currentUser(req), req.params.id);
+router.get("/:id/matches/run", async (req, res) => {
+    const candidate = await ownedCandidate(currentUser(req), req.params.id);
 
     res.json({ success: true, data: getRun(candidate.id) });
 });
@@ -92,47 +92,47 @@ const MailboxBody = z.object({
 
 // Logs in to the mailbox before saving; the password is stored encrypted and is never returned
 router.put("/:id/mail-account", async (req, res) => {
-    const candidate = ownedCandidate(currentUser(req), req.params.id);
+    const candidate = await ownedCandidate(currentUser(req), req.params.id);
 
     res.json({ success: true, data: await connectMailbox(candidate.id, MailboxBody.parse(req.body)) });
 });
 
-router.get("/:id/mail-account", (req, res) => {
-    const candidate = ownedCandidate(currentUser(req), req.params.id);
+router.get("/:id/mail-account", async (req, res) => {
+    const candidate = await ownedCandidate(currentUser(req), req.params.id);
 
-    const account = getMailAccount(candidate.id);
+    const account = await getMailAccount(candidate.id);
     if (!account) throw new NotFoundError("No mailbox connected");
 
     res.json({ success: true, data: account });
 });
 
-router.delete("/:id/mail-account", (req, res) => {
-    const candidate = ownedCandidate(currentUser(req), req.params.id);
+router.delete("/:id/mail-account", async (req, res) => {
+    const candidate = await ownedCandidate(currentUser(req), req.params.id);
 
-    res.json({ success: true, data: { removed: deleteMailAccount(candidate.id) } });
+    res.json({ success: true, data: { removed: await deleteMailAccount(candidate.id) } });
 });
 
 const QueueBody = z.object({ matchIds: z.array(z.number().int().positive()).max(200).optional() });
 
 // Queues every approved match that has an employer email. Sending happens in the background, paced.
 // (matchIds only narrows the choice among this candidate's own matches; ids of other people's are ignored.)
-router.post("/:id/applications/queue", (req, res) => {
-    const candidate = ownedCandidate(currentUser(req), req.params.id);
+router.post("/:id/applications/queue", async (req, res) => {
+    const candidate = await ownedCandidate(currentUser(req), req.params.id);
 
-    res.status(202).json({ success: true, data: queueApproved(candidate.id, QueueBody.parse(req.body ?? {}).matchIds) });
+    res.status(202).json({ success: true, data: await queueApproved(candidate.id, QueueBody.parse(req.body ?? {}).matchIds) });
 });
 
-router.get("/:id/applications", (req, res) => {
-    const candidate = ownedCandidate(currentUser(req), req.params.id);
+router.get("/:id/applications", async (req, res) => {
+    const candidate = await ownedCandidate(currentUser(req), req.params.id);
 
     const { status } = z.object({ status: z.enum(["queued", "sending", "sent", "failed", "cancelled"]).optional() }).parse(req.query);
-    res.json({ success: true, data: listApplications(candidate.id, status) });
+    res.json({ success: true, data: await listApplications(candidate.id, status) });
 });
 
-router.get("/:id/matches", (req, res) => {
-    const candidate = ownedCandidate(currentUser(req), req.params.id);
+router.get("/:id/matches", async (req, res) => {
+    const candidate = await ownedCandidate(currentUser(req), req.params.id);
 
-    res.json({ success: true, data: listMatches(candidate.id, ListQuery.parse(req.query)) });
+    res.json({ success: true, data: await listMatches(candidate.id, ListQuery.parse(req.query)) });
 });
 
 export default router;

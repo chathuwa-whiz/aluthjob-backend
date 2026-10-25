@@ -1,4 +1,4 @@
-import { getDatabase } from "../db/database.js";
+import { getDatabase, isUniqueViolation } from "../db/database.js";
 
 export type Role = "user" | "admin";
 
@@ -35,87 +35,88 @@ const db = () => getDatabase();
 const now = () => new Date().toISOString();
 
 /** Returns undefined when the address is already registered. */
-export function createUser(email: string, passwordHash: string): User | undefined {
+export async function createUser(email: string, passwordHash: string): Promise<User | undefined> {
     try {
-        const result = db()
-            .prepare("INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)")
-            .run(email, passwordHash, now());
-
-        return getUser(Number(result.lastInsertRowid));
+        const createdAt = now();
+        const id = await db().insert("INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)", [email, passwordHash, createdAt]);
+        // built here, not read back: a sign-up for a taken address (one failed insert) must cost the same as a new one
+        return { id, email, role: "user", createdAt, lastLoginAt: null, emailVerified: false };
     } catch (error) {
-        if (error instanceof Error && /UNIQUE constraint failed: users\.email/.test(error.message)) return undefined;
+        if (isUniqueViolation(error)) return undefined;
         throw error;
     }
 }
 
-export function getUser(id: number): User | undefined {
-    const row = db().prepare("SELECT * FROM users WHERE id = ?").get(id) as unknown as UserRow | undefined;
+export async function getUser(id: number): Promise<User | undefined> {
+    const row = await db().get<UserRow>("SELECT * FROM users WHERE id = ?", [id]);
     return row && toUser(row);
 }
 
-export function findUserWithHash(email: string): (User & { passwordHash: string }) | undefined {
-    const row = db().prepare("SELECT * FROM users WHERE email = ?").get(email) as unknown as UserRow | undefined;
+export async function findUserWithHash(email: string): Promise<(User & { passwordHash: string }) | undefined> {
+    const row = await db().get<UserRow>("SELECT * FROM users WHERE email = ?", [email]);
     return row && { ...toUser(row), passwordHash: row.password_hash };
 }
 
-export function getPasswordHash(id: number): string | undefined {
-    const row = db().prepare("SELECT password_hash FROM users WHERE id = ?").get(id) as unknown as { password_hash: string } | undefined;
+export async function getPasswordHash(id: number): Promise<string | undefined> {
+    const row = await db().get<{ password_hash: string }>("SELECT password_hash FROM users WHERE id = ?", [id]);
     return row?.password_hash;
 }
 
-export function setPasswordHash(id: number, passwordHash: string): void {
-    db().prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(passwordHash, id);
+export async function setPasswordHash(id: number, passwordHash: string): Promise<void> {
+    await db().run("UPDATE users SET password_hash = ? WHERE id = ?", [passwordHash, id]);
 }
 
 /** Idempotent: the first verification time is kept. */
-export function markEmailVerified(id: number): void {
-    db().prepare("UPDATE users SET email_verified_at = COALESCE(email_verified_at, ?) WHERE id = ?").run(now(), id);
+export async function markEmailVerified(id: number): Promise<void> {
+    await db().run("UPDATE users SET email_verified_at = COALESCE(email_verified_at, ?) WHERE id = ?", [now(), id]);
 }
 
-export function setRole(id: number, role: Role): void {
-    db().prepare("UPDATE users SET role = ? WHERE id = ?").run(role, id);
+export async function setRole(id: number, role: Role): Promise<void> {
+    await db().run("UPDATE users SET role = ? WHERE id = ?", [role, id]);
 }
 
-export function touchLogin(id: number): void {
-    db().prepare("UPDATE users SET last_login_at = ? WHERE id = ?").run(now(), id);
+export async function touchLogin(id: number): Promise<void> {
+    await db().run("UPDATE users SET last_login_at = ? WHERE id = ?", [now(), id]);
 }
 
 /** Deletes the user; their sessions, resumes, matches, mailbox and applications go with them (ON DELETE CASCADE). */
-export function deleteUser(id: number): boolean {
-    return db().prepare("DELETE FROM users WHERE id = ?").run(id).changes > 0;
+export async function deleteUser(id: number): Promise<boolean> {
+    return (await db().run("DELETE FROM users WHERE id = ?", [id])).changes > 0;
 }
 
 // ---- sessions --------------------------------------------------------------------------
 
-export function createSession(userId: number, tokenHash: string, expiresAt: Date, userAgent: string | null): void {
-    db()
-        .prepare("INSERT INTO sessions (user_id, token_hash, created_at, expires_at, user_agent) VALUES (?, ?, ?, ?, ?)")
-        .run(userId, tokenHash, now(), expiresAt.toISOString(), userAgent?.slice(0, 200) ?? null);
+export async function createSession(userId: number, tokenHash: string, expiresAt: Date, userAgent: string | null): Promise<void> {
+    await db().run(
+        "INSERT INTO sessions (user_id, token_hash, created_at, expires_at, user_agent) VALUES (?, ?, ?, ?, ?)",
+        [userId, tokenHash, now(), expiresAt.toISOString(), userAgent?.slice(0, 200) ?? null],
+    );
 }
 
 /** The user behind a live (not expired) session. */
-export function findSessionUser(tokenHash: string): User | undefined {
-    const row = db()
-        .prepare(`
-            SELECT users.* FROM sessions JOIN users ON users.id = sessions.user_id
-            WHERE sessions.token_hash = ? AND sessions.expires_at > ?
-        `)
-        .get(tokenHash, now()) as unknown as UserRow | undefined;
+export async function findSessionUser(tokenHash: string): Promise<User | undefined> {
+    const row = await db().get<UserRow>(
+        `SELECT users.* FROM sessions JOIN users ON users.id = sessions.user_id
+         WHERE sessions.token_hash = ? AND sessions.expires_at > ?`,
+        [tokenHash, now()],
+    );
 
     return row && toUser(row);
 }
 
-export function deleteSession(tokenHash: string): void {
-    db().prepare("DELETE FROM sessions WHERE token_hash = ?").run(tokenHash);
+export async function deleteSession(tokenHash: string): Promise<void> {
+    await db().run("DELETE FROM sessions WHERE token_hash = ?", [tokenHash]);
 }
 
 /** Signs a user out everywhere, optionally keeping the session they are using right now. */
-export function deleteSessionsOf(userId: number, exceptTokenHash?: string): number {
-    return db()
-        .prepare("DELETE FROM sessions WHERE user_id = ? AND token_hash IS NOT ?")
-        .run(userId, exceptTokenHash ?? null).changes as number;
+export async function deleteSessionsOf(userId: number, exceptTokenHash?: string): Promise<number> {
+    const result = exceptTokenHash
+        ? await db().run("DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?", [userId, exceptTokenHash])
+        : await db().run("DELETE FROM sessions WHERE user_id = ?", [userId]);
+
+    return result.changes;
 }
 
-export function purgeExpiredSessions(): number {
-    return db().prepare("DELETE FROM sessions WHERE expires_at <= ?").run(now()).changes as number;
+export async function purgeExpiredSessions(): Promise<number> {
+    return (await db().run("DELETE FROM sessions WHERE expires_at <= ?", [now()])).changes;
 }

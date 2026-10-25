@@ -6,7 +6,7 @@ import { after, before, beforeEach, describe, it } from "node:test";
 import { SMTPServer } from "smtp-server";
 
 // Configuration must be in place before the modules under test are loaded
-process.env.DATABASE_PATH = ":memory:";
+import "../db/test-helpers.js";
 process.env.AUTH_SCRYPT_COST = "1024"; // fast hashing for tests; production uses 32768
 process.env.MAIL_SECRET = "test-secret-".repeat(4);
 process.env.FRONTEND_URL = "http://localhost:3000";
@@ -198,7 +198,7 @@ describe("email verification", () => {
     it("answers unknown, expired, used and malformed links identically", async () => {
         await register("same@example.com");
         const token = await confirmationToken("same@example.com");
-        m.db.getDatabase().prepare("UPDATE email_tokens SET expires_at = ?").run(new Date(Date.now() - 1000).toISOString());
+        await m.db.getDatabase().run("UPDATE email_tokens SET expires_at = ?", [new Date(Date.now() - 1000).toISOString()]);
 
         const expired = await request("POST", "/auth/verify-email", { body: { token } });
         const unknown = await request("POST", "/auth/verify-email", { body: { token: "x".repeat(43) } });
@@ -207,24 +207,24 @@ describe("email verification", () => {
         assert.deepEqual(expired.json, unknown.json);
         assert.equal((await request("POST", "/auth/verify-email", { body: { token: "short" } })).status, 400);
         assert.equal((await request("POST", "/auth/verify-email", { body: {} })).status, 400);
-        assert.equal(m.users.findUserWithHash("same@example.com")!.emailVerified, false);
+        assert.equal((await m.users.findUserWithHash("same@example.com"))!.emailVerified, false);
     });
 
     it("only counts for the address it was sent to", async () => {
         const user = await unverifiedUser("moved@example.com");
         const token = await confirmationToken(user.email);
 
-        m.db.getDatabase().prepare("UPDATE users SET email = 'someone-else@example.com' WHERE id = ?").run(user.id);
+        await m.db.getDatabase().run("UPDATE users SET email = 'someone-else@example.com' WHERE id = ?", [user.id]);
 
         assert.equal((await request("POST", "/auth/verify-email", { body: { token } })).status, 400);
-        assert.equal(m.users.getUser(user.id)!.emailVerified, false);
+        assert.equal((await m.users.getUser(user.id))!.emailVerified, false);
     });
 
     it("stores only a hash of each link token", async () => {
         await register("hashed@example.com");
         const token = await confirmationToken("hashed@example.com");
 
-        const rows = m.db.getDatabase().prepare("SELECT token_hash FROM email_tokens").all() as { token_hash: string }[];
+        const rows = await m.db.getDatabase().all<{ token_hash: string }>("SELECT token_hash FROM email_tokens");
         assert.ok(rows.length >= 1);
         assert.ok(rows.every((row) => row.token_hash !== token && !row.token_hash.includes(token)));
     });
@@ -237,7 +237,7 @@ describe("email verification", () => {
 
         assert.equal((await request("POST", "/auth/verify-email", { body: { token: reset } })).status, 400);
         assert.equal((await request("POST", "/auth/reset-password", { body: { token: confirm, newPassword: NEW_PASSWORD } })).status, 400);
-        assert.equal(m.users.getUser(user.id)!.emailVerified, false);
+        assert.equal((await m.users.getUser(user.id))!.emailVerified, false);
         assert.equal((await login(user.email)).status, 200, "the password was not changed");
     });
 
@@ -279,7 +279,7 @@ describe("email verification", () => {
             const response = await register("nomail@example.com");
             assert.equal(response.status, 503);
             assert.match(response.json.message, /SYSTEM_SMTP_HOST/);
-            assert.equal(m.users.findUserWithHash("nomail@example.com"), undefined);
+            assert.equal(await m.users.findUserWithHash("nomail@example.com"), undefined);
             assert.equal((await request("POST", "/auth/forgot-password", { body: { email: "nomail@example.com" } })).status, 503);
         } finally {
             process.env.NODE_ENV = original;
@@ -394,7 +394,7 @@ describe("password reset", () => {
             const response = await request("POST", "/auth/reset-password", { body: { token, newPassword } });
             assert.equal(response.status, 409, newPassword);
         }
-        assert.ok(m.tokens.peekEmailToken("reset", token), "the link still works");
+        assert.ok(await m.tokens.peekEmailToken("reset", token), "the link still works");
 
         assert.equal((await request("POST", "/auth/reset-password", { body: { token, newPassword: NEW_PASSWORD } })).status, 200);
     });
@@ -422,7 +422,7 @@ describe("password reset", () => {
         const user = await verifiedUser("late@example.com");
         await request("POST", "/auth/forgot-password", { body: { email: user.email } });
         const token = await resetToken(user.email);
-        m.db.getDatabase().prepare("UPDATE email_tokens SET expires_at = ?").run(new Date(Date.now() - 1000).toISOString());
+        await m.db.getDatabase().run("UPDATE email_tokens SET expires_at = ?", [new Date(Date.now() - 1000).toISOString()]);
 
         const expired = await request("POST", "/auth/reset-password", { body: { token, newPassword: NEW_PASSWORD } });
         const unknown = await request("POST", "/auth/reset-password", { body: { token: "z".repeat(43), newPassword: NEW_PASSWORD } });

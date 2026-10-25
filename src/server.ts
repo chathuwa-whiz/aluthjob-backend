@@ -3,22 +3,35 @@ import app from "./app.js";
 import { purgeExpiredSessions, purgeExpiredTokens } from "./auth/auth.service.js";
 import { collectVacancies, isStale, jobStoreStatus } from "./jobs/collection.service.js";
 import { enrichPending } from "./jobs/ingest.service.js";
+import { closeDatabase } from "./db/database.js";
 import { startMailWorker } from "./mail/worker.js";
 
 const port = Number(process.env.PORT ?? 4000);
 
-app.listen(port, "0.0.0.0", () => {
+const server = app.listen(port, "0.0.0.0", () => {
   console.log(
     `API running at http://0.0.0.0:${port}`
   );
 });
 
-// Expired sessions and used or expired email links are useless but would pile up in the database
-const purge = () => {
-  purgeExpiredSessions();
-  purgeExpiredTokens();
+// Give the database connections back: a free Oracle database allows few sessions, and a restart
+// (every saved file in dev) that leaves them hanging can lock the next start out for a while
+let stopping = false;
+const shutdown = () => {
+  if (stopping) return;
+  stopping = true;
+  server.close();
+  closeDatabase().finally(() => process.exit(0));
 };
-purge();
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
+// Expired sessions and used or expired email links are useless but would pile up in the database
+const purge = () =>
+  Promise.all([purgeExpiredSessions(), purgeExpiredTokens()]).catch((error: unknown) =>
+    console.warn("Could not clean up expired sessions:", error instanceof Error ? error.message : error)
+  );
+void purge();
 setInterval(purge, 60 * 60_000).unref();
 
 if (process.env.NODE_ENV === "production") {
@@ -70,6 +83,11 @@ if (ingestIntervalMinutes > 0) {
 
   // Not on every start: during development the server restarts on each saved file, and re-reading every job
   // site each time would be both slow and rude. It collects at start-up only when there is nothing or it is old.
-  if (isStale(jobStoreStatus())) void run();
+  jobStoreStatus().then(
+    (status) => {
+      if (isStale(status)) void run();
+    },
+    (error: unknown) => console.error("Could not read the vacancy store:", error instanceof Error ? error.message : error)
+  );
   setInterval(run, ingestIntervalMinutes * 60_000).unref();
 }

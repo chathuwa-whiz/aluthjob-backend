@@ -15,9 +15,6 @@ export function startMailWorker(): void {
     if (running) return;
     running = true;
 
-    const interrupted = failInterrupted();
-    if (interrupted > 0) console.warn(`${interrupted} application(s) were interrupted mid-send; marked failed for you to check`);
-
     const tick = async () => {
         let next = IDLE_POLL_MS;
 
@@ -32,7 +29,15 @@ export function startMailWorker(): void {
         if (running) timer = setTimeout(tick, next).unref();
     };
 
-    timer = setTimeout(tick, BUSY_POLL_MS).unref();
+    // Before the first tick, so an application left in 'sending' by a crash is never picked up again
+    failInterrupted().then(
+        (interrupted) => {
+            if (interrupted > 0) console.warn(`${interrupted} application(s) were interrupted mid-send; marked failed for you to check`);
+        },
+        (error: unknown) => console.error("Could not check for interrupted applications:", error instanceof Error ? error.message : error),
+    ).finally(() => {
+        if (running) timer = setTimeout(tick, BUSY_POLL_MS).unref();
+    });
 }
 
 export function stopMailWorker(): void {

@@ -28,7 +28,7 @@ const MIME: Record<string, string> = {
 };
 
 async function main() {
-    const user = userEmail ? findUserWithHash(userEmail.trim().toLowerCase()) : undefined;
+    const user = userEmail ? await findUserWithHash(userEmail.trim().toLowerCase()) : undefined;
     if (!user) throw new Error("Pass --user=<email> of an existing account (register one through the API first); resumes belong to an account");
 
     const mimetype = MIME[extname(file!).toLowerCase()];
@@ -51,7 +51,7 @@ async function main() {
     });
     console.log("Run:", summary);
 
-    for (const match of listMatches(candidateId, { limit: flag("show") ?? 15 })) {
+    for (const match of await listMatches(candidateId, { limit: flag("show") ?? 15 })) {
         const { job } = match;
         console.log(`\n${String(match.score).padStart(3)}  ${job.title} | ${job.company ?? "?"} | ${job.location ?? "?"} [${job.source}, apply by ${match.applyMethod}]`);
         console.log(`     ${match.details.reasons.join(" / ") || "(no strong signals)"}`);

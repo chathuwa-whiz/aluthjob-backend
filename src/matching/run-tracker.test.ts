@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, it } from "node:test";
 
 // Configuration must be in place before the modules under test are loaded
-process.env.DATABASE_PATH = ":memory:";
+import { clearDatabase } from "../db/test-helpers.js";
 delete process.env.COLLECTION_MAX_AGE_HOURS;
 
 type Mods = {
@@ -42,12 +42,12 @@ before(async () => {
     };
 });
 
-beforeEach(() => {
+beforeEach(async () => {
     m.tracker.forgetRuns();
     m.collection.setCollector();
-    m.db.getDatabase().exec("DELETE FROM matches; DELETE FROM jobs; DELETE FROM candidates; DELETE FROM users;");
-    const user = m.users.createUser("a@example.test", "x")!;
-    candidateId = m.candidates.createCandidate({
+    await clearDatabase();
+    const user = (await m.users.createUser("a@example.test", "x"))!;
+    candidateId = (await m.candidates.createCandidate({
         userId: user.id, hash: "h", fileName: "cv.pdf", mimeType: "application/pdf", fileData: Buffer.from("cv"),
         profile: {
             personalInfo: { fullName: "Ama", email: null, phone: null, location: "Colombo, Sri Lanka", linkedin: null, portfolio: null },
@@ -55,7 +55,7 @@ beforeEach(() => {
             education: [], experience: [{ company: "Webminds", position: "Full Stack Developer", startDate: "2023-01", endDate: "Present", responsibilities: ["Built React apps"] }],
             certifications: [], achievements: [],
         },
-    }).id;
+    })).id;
 });
 
 after(() => {
@@ -77,7 +77,7 @@ describe("following a search", () => {
             report({ source: "rooster", state: "reading", fetched: 0 });
             report({ source: "xpress", state: "reading", fetched: 50 });
             await gate;
-            m.jobs.upsertJobs([posting(1), posting(2)]);
+            await m.jobs.upsertJobs([posting(1), posting(2)]);
             report({ source: "xpress", state: "done", fetched: 2 });
             report({ source: "rooster", state: "failed", fetched: 0, error: "fetch failed" });
             return [
@@ -113,7 +113,7 @@ describe("following a search", () => {
     });
 
     it("reports which advert is being read, out of how many", async () => {
-        m.jobs.upsertJobs([posting(1), posting(2)]);
+        await m.jobs.upsertJobs([posting(1), posting(2)]);
         const seen: unknown[] = [];
         globalThis.fetch = (async () => {
             const snapshot = m.tracker.getRun(candidateId)!;
@@ -169,7 +169,7 @@ describe("following a search", () => {
         m.collection.setCollector(async () => {
             starts++;
             await tick(40);
-            m.jobs.upsertJobs([posting(1)]);
+            await m.jobs.upsertJobs([posting(1)]);
             return [{ source: "xpress", fetched: 1, inserted: 1, updated: 0 }];
         });
 
@@ -188,7 +188,7 @@ describe("following a search", () => {
     });
 
     it("measures elapsed time on the server and stops the clock when the search ends", async () => {
-        m.jobs.upsertJobs([posting(1)]);
+        await m.jobs.upsertJobs([posting(1)]);
         m.tracker.startRun(candidateId, { enrichTop: 0 });
         await until(() => m.tracker.getRun(candidateId)!.status !== "running");
 
@@ -199,12 +199,12 @@ describe("following a search", () => {
     });
 
     it("keeps a search per CV, so one person's progress is never shown for another's", async () => {
-        const other = m.candidates.createCandidate({
-            userId: m.users.createUser("b@example.test", "x")!.id, hash: "h2", fileName: "b.pdf", mimeType: "application/pdf", fileData: Buffer.from("b"),
+        const other = (await m.candidates.createCandidate({
+            userId: (await m.users.createUser("b@example.test", "x"))!.id, hash: "h2", fileName: "b.pdf", mimeType: "application/pdf", fileData: Buffer.from("b"),
             profile: { personalInfo: { fullName: "Bo", email: null, phone: null, location: null, linkedin: null, portfolio: null }, skills: [], education: [], experience: [], certifications: [], achievements: [] },
-        }).id;
+        })).id;
 
-        m.jobs.upsertJobs([posting(1)]);
+        await m.jobs.upsertJobs([posting(1)]);
         m.tracker.startRun(candidateId, { enrichTop: 0 });
         await until(() => m.tracker.getRun(candidateId)!.status !== "running");
 
