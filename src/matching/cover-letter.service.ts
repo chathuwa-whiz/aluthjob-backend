@@ -1,6 +1,6 @@
 import type { StoredJob } from "../jobs/job.repository.js";
 import type { Resume } from "../schemas/resume.schema.js";
-import { ollama, OLLAMA_LETTER_MODEL, OLLAMA_THREADS } from "../services/ollama.client.js";
+import { chat } from "../services/llm.client.js";
 import { buildProfileModel, relevantYears } from "./scoring.js";
 import { skillKey } from "./text-utils.js";
 
@@ -147,25 +147,12 @@ function cleanModelOutput(raw: string): string {
 // ---- generation ------------------------------------------------------------------------
 
 async function generateBody(facts: Facts, job: StoredJob, temperature: number): Promise<string> {
-    const request = {
-        model: OLLAMA_LETTER_MODEL,
-        messages: [
-            { role: "system", content: SYSTEM_PROMPT },
-            { role: "user", content: `${factsText(facts)}\n\n${jobText(job)}\n\nWrite the two-paragraph letter body now.` },
-        ],
-        stream: true as const,
-        keep_alive: "30m",
-        options: { temperature, num_ctx: 2048, num_predict: 400, num_thread: OLLAMA_THREADS },
-    };
-
-    // Reasoning is far too slow on a CPU model; models without a reasoning mode reject the flag
-    const stream = await ollama.chat({ ...request, think: false }).catch((error: unknown) => {
-        if (error instanceof Error && /think/i.test(error.message)) return ollama.chat(request);
-        throw error;
+    const { content } = await chat({
+        system: SYSTEM_PROMPT,
+        user: `${factsText(facts)}\n\n${jobText(job)}\n\nWrite the two-paragraph letter body now.`,
+        temperature,
+        maxTokens: 400,
     });
-
-    let content = "";
-    for await (const chunk of stream) content += chunk.message.content;
 
     return cleanModelOutput(content);
 }
@@ -227,7 +214,7 @@ export async function draftCoverLetter(profile: Resume, job: StoredJob, matchedS
             if (!problem) return { subject: buildSubject(profile, job), text: assemble(profile, body), writtenBy: "model" };
             console.warn(`Cover letter attempt ${attempt + 1} rejected: ${problem}`);
         } catch (error) {
-            // Ollama down or model missing: no point retrying, the template keeps the pipeline moving
+            // Model down, out of keys or misconfigured: no point retrying, the template keeps the pipeline moving
             console.warn("Cover letter model unavailable:", error instanceof Error ? error.message : error);
             break;
         }
