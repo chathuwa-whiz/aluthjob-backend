@@ -282,18 +282,57 @@ const SCHEMA = [
 // ---- connection ------------------------------------------------------------------------------
 
 let ready: Promise<oracledb.Pool> | undefined;
+/** After a failed connect, later calls fail at once for a few seconds instead of each waiting out a new attempt. */
+let failure: { error: Error; at: number } | undefined;
+const RETRY_AFTER_MS = 10_000;
+
+const credentials = () => ({
+    user: process.env.ORACLE_USER || "ADMIN",
+    password: required("ORACLE_PASSWORD"),
+    connectString: required("ORACLE_CONNECT_STRING"),
+});
+
+function explain(message: string): string {
+    if (/ORA-01017/.test(message)) return "The user name or password is wrong (ORACLE_USER / ORACLE_PASSWORD).";
+    if (/ORA-12514|ORA-12154|ORA-12504|DPY-6001|DPY-6002|NJS-518/.test(message)) return "The service name in ORACLE_CONNECT_STRING is not known to the database. Copy the connection string again from the console.";
+    if (/ORA-28759|wallet|certificate|DPY-4018|DPY-6005.*SSL|SSL|TLS/i.test(message)) return "The secure connection could not be set up. Check that \"Require mutual TLS (mTLS)\" is off on the database, or configure a wallet.";
+    return "The database cannot be reached from this server. Check that it is running (an Always Free database stops after 7 days without activity), that its network access allows this server's IP address, and that outbound port 1521 is open.";
+}
+
+/**
+ * The pool hides why it cannot connect: it keeps retrying in the background and the caller only sees
+ * "NJS-040 connection request timeout" a minute later. A single direct connection without retries
+ * fails fast with the real reason.
+ */
+async function checkConnection(): Promise<void> {
+    const { connectString, ...rest } = credentials();
+
+    try {
+        const connection = await oracledb.getConnection({
+            ...rest,
+            // the connection string from the Oracle console retries 20 times, 3 seconds apart
+            connectString: connectString.replace(/\(\s*retry_count\s*=\s*\d+\s*\)/i, "(retry_count=0)"),
+            transportConnectTimeout: 15,
+        });
+        await connection.close();
+    } catch (error) {
+        const reason = (error instanceof Error ? error.message : String(error)).split("\n")[0]!;
+        throw new Error(`Cannot connect to the Oracle database: ${reason} ${explain(reason)}`, { cause: error });
+    }
+}
 
 async function open(): Promise<oracledb.Pool> {
+    await checkConnection();
+
     const pool = await oracledb.createPool({
-        user: process.env.ORACLE_USER || "ADMIN",
-        password: required("ORACLE_PASSWORD"),
-        connectString: required("ORACLE_CONNECT_STRING"),
+        ...credentials(),
         poolMin: 1,
         // the Always Free database allows only a handful of sessions
         poolMax: Number(process.env.ORACLE_POOL_MAX ?? 4),
         poolIncrement: 1,
         // idle connections to a cloud database get dropped; check them before handing one out
         poolPingInterval: 30,
+        queueTimeout: 30_000,
     });
 
     try {
@@ -312,13 +351,16 @@ async function open(): Promise<oracledb.Pool> {
 }
 
 async function lease<T>(use: (connection: oracledb.Connection) => Promise<T>): Promise<T> {
+    if (!ready && failure && Date.now() - failure.at < RETRY_AFTER_MS) throw failure.error;
     ready ??= open();
 
     let pool: oracledb.Pool;
     try {
         pool = await ready;
+        failure = undefined;
     } catch (error) {
         ready = undefined; // allow a later call to try again, e.g. after the database was started
+        failure = { error: error as Error, at: Date.now() };
         throw error;
     }
 
