@@ -119,8 +119,15 @@ export async function previewMessage(matchId: number): Promise<{ message: Prepar
 
 // ---- queueing --------------------------------------------------------------------------
 
-/** Queues one approved match. Queueing the same match twice is harmless. */
-export async function queueMatch(matchId: number): Promise<{ application: applications.Application; created: boolean }> {
+/**
+ * Queues one approved match. Queueing the same match twice is harmless: the second call returns the first.
+ * With `again` the person has asked to send an application a second time (a sent or cancelled one is queued
+ * afresh); without it, an application that exists is never touched, so a double click cannot send twice.
+ */
+export async function queueMatch(
+    matchId: number,
+    options: { again?: boolean } = {},
+): Promise<{ application: applications.Application; created: boolean }> {
     const match = await getMatch(matchId);
     if (!match) throw new NotFoundError("Match not found");
 
@@ -128,7 +135,14 @@ export async function queueMatch(matchId: number): Promise<{ application: applic
     const [problem] = sendProblems(match, Boolean(account), account?.email);
     if (problem) throw new RuleError(problem);
 
-    return applications.enqueue(match.id, match.candidateId, match.job.applyEmail!.toLowerCase());
+    const to = match.job.applyEmail!.toLowerCase();
+    const queued = await applications.enqueue(match.id, match.candidateId, to);
+
+    if (options.again && !queued.created && (queued.application.status === "sent" || queued.application.status === "cancelled")) {
+        if (await applications.restart(queued.application.id, to)) return { application: (await applications.getApplication(queued.application.id))!, created: true };
+    }
+
+    return queued;
 }
 
 export interface QueueResult {

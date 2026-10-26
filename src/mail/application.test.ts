@@ -219,6 +219,33 @@ describe("queueing", () => {
         assert.equal(second.application.id, first.application.id);
     });
 
+    it("sends a second time only when asked to, and keeps the record of the first send", async () => {
+        const match = await approvedMatch();
+        const first = (await m.service.queueMatch(match.id)).application;
+        assert.equal(await m.service.processNext(), "sent");
+        const sentAt = (await m.apps.getApplication(first.id))!.sentAt;
+        assert.equal(received.length, 1);
+
+        // an ordinary queue request (a double click, the bulk "send all") must never send it twice
+        const plain = await m.service.queueMatch(match.id);
+        assert.equal(plain.created, false);
+        assert.equal(plain.application.status, "sent");
+        assert.equal(await m.service.processNext(), "idle");
+
+        const again = await m.service.queueMatch(match.id, { again: true });
+        assert.equal(again.created, true);
+        assert.equal(again.application.id, first.id, "one application per match: the row is reused");
+        assert.equal(again.application.status, "queued");
+        assert.equal(again.application.sentAt, sentAt, "when it was first sent is not lost while the second send waits");
+
+        // a second click while it waits queues nothing more
+        assert.equal((await m.service.queueMatch(match.id, { again: true })).created, false);
+
+        assert.equal(await m.service.processNext(), "sent");
+        assert.equal(received.length, 2);
+        assert.equal((await m.apps.getApplication(first.id))!.status, "sent");
+    });
+
     it("queues a whole batch and explains what it left out", async () => {
         const ok = await approvedMatch();
         await approvedMatch({ email: null });

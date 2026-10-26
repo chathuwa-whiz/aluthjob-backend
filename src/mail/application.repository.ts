@@ -99,6 +99,22 @@ export async function enqueue(matchId: number, candidateId: number, toEmail: str
     }
 }
 
+/**
+ * Puts an application that was already sent (or cancelled) back in the queue, on the user's explicit request.
+ * The row is reused because there is one application per match; `sent_at` and the stored copy of the earlier
+ * message stay until the new send replaces them, so "sent before" is never lost, even if the new attempt fails.
+ * Returns false when the application is in any other state (e.g. a second click while it is already queued).
+ */
+export async function restart(id: number, toEmail: string): Promise<boolean> {
+    const at = now();
+    return (
+        await db().run(
+            "UPDATE applications SET status = 'queued', error = NULL, attempts = 0, to_email = ?, next_attempt_at = ?, updated_at = ? WHERE id = ? AND status IN ('sent', 'cancelled')",
+            [toEmail, at, at, id],
+        )
+    ).changes === 1;
+}
+
 /** The next queued application that is due, oldest first. */
 export async function nextDue(): Promise<Application | undefined> {
     const row = await db().get<ApplicationRow>(

@@ -52,9 +52,12 @@ router.post("/:id/confirm-address", async (req, res) => {
     res.json({ success: true, data: await confirmAddress(id, address) });
 });
 
-// Queues this one approved match for sending (paced, in the background)
+// Queues this one approved match for sending (paced, in the background). `again: true` is the person's explicit
+// "send it a second time" after an application was already sent.
 router.post("/:id/send", async (req, res) => {
-    const { application, created } = await queueMatch(await matchIdOf(req));
+    const id = await matchIdOf(req);
+    const { again } = z.object({ again: z.boolean().optional() }).parse(req.body ?? {});
+    const { application, created } = await queueMatch(id, { again });
     res.status(created ? 202 : 200).json({ success: true, data: application });
 });
 
