@@ -13,7 +13,8 @@
     "match": "tsx src/scripts/match.ts",
     "enrich": "tsx src/scripts/enrich.ts",
     "make-admin": "tsx src/scripts/make-admin.ts",
-    "assign-candidate": "tsx src/scripts/assign-candidate.ts"
+    "assign-candidate": "tsx src/scripts/assign-candidate.ts",
+    "alerts:preview": "tsx src/scripts/alert-preview.ts"
   },
   "keywords": [],
   "author": "",

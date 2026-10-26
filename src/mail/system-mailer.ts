@@ -7,8 +7,14 @@ import { ConfigError } from "../errors.js";
 export interface OutgoingMail {
     to: string;
     subject: string;
-    /** Plain text only: no tracking pixels, no remote content. */
+    /** Always present, and complete on its own: the HTML part is a prettier copy of it, never the only copy. */
     text: string;
+    /** Optional styled version. Never contains tracking pixels or remote content; images are attached and referenced by cid. */
+    html?: string;
+    /** Extra headers, e.g. List-Unsubscribe. */
+    headers?: Record<string, string>;
+    /** Inline images referenced from the HTML as cid:<cid>. */
+    attachments?: { filename: string; path: string; cid: string }[];
 }
 
 export interface SystemMailer {
@@ -60,7 +66,21 @@ function smtpMailer(): SystemMailer {
             socketTimeout: 30_000,
         });
 
-        smtp = { key, mailer: { send: async (mail) => void (await transport.sendMail({ from, to: mail.to, subject: mail.subject, text: mail.text })) } };
+        smtp = {
+            key,
+            mailer: {
+                send: async (mail) =>
+                    void (await transport.sendMail({
+                        from,
+                        to: mail.to,
+                        subject: mail.subject,
+                        text: mail.text,
+                        ...(mail.html && { html: mail.html }),
+                        ...(mail.headers && { headers: mail.headers }),
+                        ...(mail.attachments && { attachments: mail.attachments.map((file) => ({ ...file, contentDisposition: "inline" as const })) }),
+                    })),
+            },
+        };
     }
 
     return smtp.mailer;

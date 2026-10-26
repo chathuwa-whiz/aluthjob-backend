@@ -14,6 +14,7 @@ import candidateRoutes from "./routes/candidate.routes.js";
 import matchRoutes from "./routes/match.routes.js";
 import applicationRoutes from "./routes/application.routes.js";
 import adminRoutes from "./routes/admin.routes.js";
+import { alertLinkRoutes, alertPreferenceRoutes } from "./routes/alert.routes.js";
 
 const app = express();
 
@@ -34,6 +35,7 @@ app.get("/api/v1/health", (_req, res) => {
   res.json({ status: "ok" });
 });
 app.use("/api/v1/auth", authRoutes); // register and login are public; the rest of that router guards itself
+app.use("/api/v1/alerts", alertLinkRoutes); // buttons in job-alert emails: authorised by the signed token in the link
 
 // ---- everything below requires a signed-in user with a confirmed email address ---------
 // Default deny: this guard sits in front of every route registered after it, so a new route is
@@ -45,6 +47,7 @@ app.use("/api/v1/jobs", jobRoutes);
 app.use("/api/v1/candidates", candidateRoutes);
 app.use("/api/v1/matches", matchRoutes);
 app.use("/api/v1/applications", applicationRoutes);
+app.use("/api/v1/alerts", alertPreferenceRoutes);
 // The administrators' console: works across accounts, so the role check sits in front of the whole router
 app.use("/api/v1/admin", requireAdmin, adminRoutes);
 

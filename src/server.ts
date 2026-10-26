@@ -5,6 +5,7 @@ import { collectVacancies, isStale, jobStoreStatus } from "./jobs/collection.ser
 import { enrichPending } from "./jobs/ingest.service.js";
 import { closeDatabase } from "./db/database.js";
 import { startMailWorker } from "./mail/worker.js";
+import { runAlertCycle } from "./alerts/alert.service.js";
 
 const port = Number(process.env.PORT ?? 4000);
 
@@ -52,6 +53,27 @@ if (process.env.MAIL_WORKER !== "off") {
     startMailWorker();
   } else {
     console.warn("Mail worker not started: set MAIL_SECRET (32+ characters) to enable sending applications");
+  }
+}
+
+// Job-alert emails: once an hour the server checks who is due (a daily or weekly digest, only when there is
+// something new) and sends it. Off unless JOB_ALERTS=on; see .env.example.
+if (process.env.JOB_ALERTS === "on") {
+  const runAlerts = () =>
+    runAlertCycle().then(
+      (result) => {
+        if (typeof result === "object" && (result.sent > 0 || result.baselined > 0 || result.failed > 0)) console.log("Job alerts:", result);
+      },
+      (error: unknown) => console.error("Job alert round failed:", error instanceof Error ? error.message : error)
+    );
+
+  if (!process.env.SYSTEM_SMTP_HOST) console.warn("JOB_ALERTS=on but SYSTEM_SMTP_HOST is not set: alert emails are only printed to the console");
+
+  if ((process.env.ALERT_SECRET ?? "").length < 32 && (process.env.MAIL_SECRET ?? "").length < 32) {
+    console.warn("JOB_ALERTS=on but neither ALERT_SECRET nor MAIL_SECRET (32+ characters) is set: the buttons in the emails cannot be signed, so no alerts are sent");
+  } else {
+    setTimeout(runAlerts, 2 * 60_000).unref();
+    setInterval(runAlerts, 60 * 60_000).unref();
   }
 }
 
