@@ -29,7 +29,8 @@ export async function request(url: string, init: RequestInit = {}): Promise<Resp
 
             if (response.ok) return response;
             if (response.status < 500 && response.status !== 429) {
-                throw new Error(`${init.method ?? "GET"} ${url} -> HTTP ${response.status}`);
+                const blocked = response.status === 403 ? " (the site is refusing this server's requests; usually a temporary block on its IP address)" : "";
+                throw new Error(`${init.method ?? "GET"} ${url} -> HTTP ${response.status}${blocked}`);
             }
             if (attempt >= RETRIES) throw new Error(`${url} -> HTTP ${response.status}`);
         } catch (error) {
