@@ -1,6 +1,7 @@
 import { getDatabase, isUniqueViolation } from "../db/database.js";
 import { decryptSecret, encryptSecret } from "./secret-box.js";
 import type { SmtpSettings } from "./smtp.js";
+import { NotFoundError } from "../errors.js";
 
 /** What the API may show: everything except the password. */
 export interface MailAccount {
@@ -39,10 +40,12 @@ const toAccount = (row: MailAccountRow): MailAccount => ({
 
 const selectRow = (candidateId: number) => getDatabase().get<MailAccountRow>("SELECT * FROM mail_accounts WHERE candidate_id = ?", [candidateId]);
 
-export async function saveMailAccount(input: Omit<MailAccount, "verifiedAt"> & { password: string }): Promise<MailAccount> {
+export async function saveMailAccount(input: Omit<MailAccount, "verifiedAt"> & { password: string }, expectedOwnerId?: number): Promise<MailAccount> {
     const now = new Date().toISOString();
 
     await getDatabase().transaction(async (tx) => {
+        const candidate = await tx.get<{ user_id: number | null }>("SELECT user_id FROM candidates WHERE id = ? FOR UPDATE", [input.candidateId]);
+        if (!candidate || (expectedOwnerId !== undefined && candidate.user_id !== expectedOwnerId)) throw new NotFoundError("Candidate not found");
         const saved = await tx.run(
             `UPDATE mail_accounts
              SET email = ?, from_name = ?, host = ?, port = ?, secure = ?, username = ?, password_enc = ?, verified_at = ?, updated_at = ?

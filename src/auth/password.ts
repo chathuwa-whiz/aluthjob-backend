@@ -60,6 +60,8 @@ const COMMON = new Set(
 
 /** Throws a RuleError that explains what is wrong; passwords are never logged or echoed back. */
 export function assertAcceptablePassword(password: string, email: string): void {
+    // Check the same representation that scrypt verifies, including compatibility characters.
+    password = password.normalize("NFKC");
     if (password.length < MIN_PASSWORD_LENGTH) throw new RuleError(`Use a password of at least ${MIN_PASSWORD_LENGTH} characters`);
     if (password.length > MAX_PASSWORD_LENGTH) throw new RuleError(`Use a password of at most ${MAX_PASSWORD_LENGTH} characters`);
 

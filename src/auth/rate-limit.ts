@@ -2,14 +2,11 @@ import { TooManyRequestsError } from "../errors.js";
 
 interface Window {
     count: number;
+    pending: number;
     resetAt: number;
 }
 
-/**
- * Fixed-window counter kept in memory: enough for one API process, and it resets on restart. Callers
- * check before doing the work (`assertAllowed`) and count only what should count (`record`), so a
- * successful login does not use up the allowance of a user who simply mistyped a few times earlier.
- */
+/** Process-local fixed windows. Reserve before awaiting work so concurrent attempts count too. */
 export class RateLimiter {
     private readonly windows = new Map<string, Window>();
 
@@ -18,43 +15,67 @@ export class RateLimiter {
         private readonly windowMs: number,
         private readonly label = "attempts",
         private readonly clock: () => number = Date.now,
+        private readonly maxKeys = 20_000,
     ) {}
 
     private active(key: string): Window | undefined {
         const window = this.windows.get(key);
-        if (window && window.resetAt <= this.clock()) {
+        if (window && window.resetAt <= this.clock() && window.pending === 0) {
             this.windows.delete(key);
             return undefined;
         }
         return window;
     }
 
-    /** Throws TooManyRequestsError (HTTP 429) when the key has used up its allowance. */
+    private window(key: string): Window {
+        const existing = this.active(key);
+        if (existing) return existing;
+        if (this.windows.size >= this.maxKeys) {
+            for (const [name, entry] of this.windows) {
+                if (entry.resetAt <= this.clock() && entry.pending === 0) this.windows.delete(name);
+            }
+            // Fail closed rather than evicting active counters, which would reset attackers' allowances.
+            if (this.windows.size >= this.maxKeys) throw new TooManyRequestsError("Too many requests. Try again later", 60);
+        }
+        const window = { count: 0, pending: 0, resetAt: this.clock() + this.windowMs };
+        this.windows.set(key, window);
+        return window;
+    }
+
     assertAllowed(key: string): void {
         const window = this.active(key);
-        if (window && window.count >= this.max) {
+        if (window && window.count + window.pending >= this.max) {
             const seconds = Math.max(1, Math.ceil((window.resetAt - this.clock()) / 1000));
             throw new TooManyRequestsError(`Too many ${this.label}. Try again in ${Math.ceil(seconds / 60)} minute(s)`, seconds);
         }
+        if (!window) this.window(key);
     }
 
     record(key: string): void {
-        const window = this.active(key);
+        this.window(key).count++;
+    }
 
-        if (window) window.count++;
-        else this.windows.set(key, { count: 1, resetAt: this.clock() + this.windowMs });
-
-        // keep memory bounded when many different addresses probe the API
-        if (this.windows.size > 20_000) {
-            for (const [name, entry] of this.windows) if (entry.resetAt <= this.clock()) this.windows.delete(name);
-        }
+    /** Settle once after work: failures keep the attempt, successes release it, optionally clearing failures. */
+    reserve(key: string): (success?: boolean, clearFailures?: boolean) => void {
+        this.assertAllowed(key);
+        const window = this.window(key);
+        window.pending++;
+        let settled = false;
+        return (success = false, clearFailures = false) => {
+            if (settled) return;
+            settled = true;
+            window.pending--;
+            if (!success) window.count++;
+            else if (clearFailures) window.count = 0;
+        };
     }
 
     clear(key: string): void {
-        this.windows.delete(key);
+        const window = this.active(key);
+        if (window?.pending) window.count = 0;
+        else this.windows.delete(key);
     }
 
-    /** Test helper */
     reset(): void {
         this.windows.clear();
     }

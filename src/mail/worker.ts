@@ -24,6 +24,7 @@ export function startMailWorker(): void {
         let next = IDLE_POLL_MS;
 
         try {
+            await failInterrupted();
             const result = await processNext();
             lastTick = { at: new Date().toISOString(), result };
             if (result === "sent" || result === "failed" || result === "cancelled") next = BUSY_POLL_MS;
@@ -37,7 +38,7 @@ export function startMailWorker(): void {
         if (running) timer = setTimeout(tick, next).unref();
     };
 
-    // Before the first tick, so an application left in 'sending' by a crash is never picked up again
+    // Only expired claims: another API process may still be sending with a live heartbeat.
     failInterrupted().then(
         (interrupted) => {
             if (interrupted > 0) console.warn(`${interrupted} application(s) were interrupted mid-send; marked failed for you to check`);

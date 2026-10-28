@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { after, before, beforeEach, describe, it } from "node:test";
+import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 
 // Configuration must be in place before the modules under test are loaded
 import { clearDatabase } from "../db/test-helpers.js";
@@ -12,10 +12,11 @@ type Mods = {
     jobs: typeof import("../jobs/job.repository.js");
     collection: typeof import("../jobs/collection.service.js");
     tracker: typeof import("./run-tracker.js");
+    sources: typeof import("../jobs/sources/index.js");
 };
 let m: Mods;
 let candidateId: number;
-const realFetch = globalThis.fetch;
+let realEnrich: import("../jobs/types.js").JobSource["enrich"];
 
 const posting = (n: number) => ({
     source: "xpress" as const, externalId: `job-${n}`, url: `https://example.test/${n}`, title: `Full Stack Developer ${n}`,
@@ -39,7 +40,9 @@ before(async () => {
         jobs: await import("../jobs/job.repository.js"),
         collection: await import("../jobs/collection.service.js"),
         tracker: await import("./run-tracker.js"),
+        sources: await import("../jobs/sources/index.js"),
     };
+    realEnrich = m.sources.sources.xpress.enrich;
 });
 
 beforeEach(async () => {
@@ -58,8 +61,9 @@ beforeEach(async () => {
     })).id;
 });
 
+afterEach(() => { m.sources.sources.xpress.enrich = realEnrich; });
+
 after(() => {
-    globalThis.fetch = realFetch;
     m.collection.setCollector();
 });
 
@@ -115,11 +119,11 @@ describe("following a search", () => {
     it("reports which advert is being read, out of how many", async () => {
         await m.jobs.upsertJobs([posting(1), posting(2)]);
         const seen: unknown[] = [];
-        globalThis.fetch = (async () => {
+        m.sources.sources.xpress.enrich = async (job) => {
             const snapshot = m.tracker.getRun(candidateId)!;
             seen.push({ phase: snapshot.phase, ...snapshot.adverts });
-            return Response.json({ jobInfo: "Build React apps", education: "Any", experience: "Any", salaryRange: "Any" });
-        }) as typeof fetch;
+            return { ...job, description: "Build React apps" };
+        };
 
         m.tracker.startRun(candidateId, { enrichTop: 2 });
         await until(() => m.tracker.getRun(candidateId)!.status !== "running");

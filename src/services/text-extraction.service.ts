@@ -1,52 +1,40 @@
-import { PDFParse } from "pdf-parse";
-import mammoth from "mammoth";
+import { fork } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { RuleError } from "../errors.js";
+import { WorkBudget } from "../security/work-budget.js";
 
-export interface ResumeLink {
-    text: string;
-    url: string;
-}
+export interface ResumeLink { text: string; url: string; }
+export interface ExtractedResume { text: string; links: ResumeLink[]; }
 
-export interface ExtractedResume {
-    text: string;
-    /** Hyperlink annotations; their URLs are not part of the visible text. */
-    links: ResumeLink[];
-}
+const parsers = new WorkBudget(2, "Document processing");
 
-const HTML_LINK_RE = /<a\s+[^>]*href="([^"]+)"[^>]*>(.*?)<\/a>/gi;
-
-export async function extractResumeContent(
-    file: Express.Multer.File
-): Promise<ExtractedResume> {
-    let text = "";
-    let links: ResumeLink[] = [];
-
-    if(file.mimetype === "application/pdf") {
-        const parser = new PDFParse({ data: file.buffer });
-        const result = await parser.getText();
-        const info = await parser.getInfo({ parsePageInfo: true });
-        await parser.destroy();
-        text = result.text;
-        links = info.pages.flatMap((page) => page.links);
-    } else if (file.mimetype === "application/msword" || file.mimetype === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
-        const result = await mammoth.extractRawText({ buffer: file.buffer });
-        text = result.value;
-
-        const html = await mammoth.convertToHtml({ buffer: file.buffer });
-        links = [...html.value.matchAll(HTML_LINK_RE)].map((match) => ({
-            url: match[1]!,
-            text: match[2]!.replace(/<[^>]+>/g, "").trim(),
-        }));
-    } else {
-        throw new Error("Unsupported file type");
-    }
-
-    // Collapse layout whitespace; every extra character costs prompt tokens on a CPU-only model
-    return {
-        text: text
-            .replace(/[ \t]+/g, " ")
-            .replace(/ ?\n ?/g, "\n")
-            .replace(/\n{3,}/g, "\n\n")
-            .trim(),
-        links,
-    };
+/** Untrusted parsers run outside the API process, with a heap budget and a hard deadline. */
+export function extractResumeContent(file: Express.Multer.File): Promise<ExtractedResume> {
+    return parsers.run(() => new Promise((resolve, reject) => {
+        const compiled = join(__dirname, "document-worker.js");
+        const source = !existsSync(compiled);
+        const child = fork(source ? join(__dirname, "document-worker.ts") : compiled, [], {
+            execArgv: ["--max-old-space-size=192", ...(source ? ["--import", "tsx"] : [])],
+            serialization: "advanced",
+            stdio: ["ignore", "ignore", "ignore", "ipc"],
+            windowsHide: true,
+            // Parsing does not need database credentials, mailbox keys, or API tokens.
+            env: Object.fromEntries(Object.entries(process.env).filter(([name]) => /^(PATH|SystemRoot|WINDIR|TEMP|TMP)$/i.test(name))),
+        });
+        const failure = () => new RuleError("This CV could not be read within the document limits. Use a text-based PDF or Word document with at most 100 pages");
+        let settled = false;
+        const finish = (result?: ExtractedResume) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            child.kill();
+            if (result) resolve(result); else reject(failure());
+        };
+        const timer = setTimeout(() => finish(), 20_000);
+        child.once("error", () => finish());
+        child.once("exit", () => finish());
+        child.once("message", (message: { result?: ExtractedResume }) => finish(message.result));
+        child.send({ buffer: file.buffer, mimeType: file.mimetype }, (error) => { if (error) finish(); });
+    }));
 }

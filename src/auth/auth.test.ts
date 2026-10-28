@@ -144,6 +144,48 @@ async function signUpUnverified(email: string) {
 // ---- registration, sessions ------------------------------------------------------------
 
 describe("registration and sessions", () => {
+    it("rolls back password, token and session changes together on failure", async () => {
+        const user = await m.users.createUser("credential-rollback@example.com", "original-hash");
+        assert.ok(user);
+        await m.users.createSession(user.id, "rollback-session", new Date(Date.now() + 60_000), null);
+        const token = await m.tokens.issueEmailToken(user.id, "reset", user.email, 60_000);
+        await assert.rejects(m.users.withUserLock(user.id, async (tx) => {
+            await m.tokens.consumeEmailToken("reset", token, tx);
+            await m.users.setPasswordHash(user.id, "replacement-hash", tx);
+            await m.users.deleteSessionsOf(user.id, undefined, tx);
+            throw new Error("simulated transaction failure");
+        }), /simulated transaction failure/);
+        assert.equal(await m.users.getPasswordHash(user.id), "original-hash");
+        assert.ok(await m.tokens.peekEmailToken("reset", token));
+        assert.ok(await m.users.findSessionUser("rollback-session"));
+        await m.users.deleteUser(user.id);
+    });
+
+    it("leaves only one usable link after concurrent password-reset requests", async () => {
+        const user = await m.users.createUser("concurrent-link@example.com", "test-hash");
+        assert.ok(user);
+        const tokens = await Promise.all(Array.from({ length: 4 }, () => m.tokens.issueEmailToken(user.id, "reset", user.email, 60_000)));
+        const usable = await Promise.all(tokens.map((token) => m.tokens.peekEmailToken("reset", token)));
+        assert.equal(usable.filter(Boolean).length, 1);
+        await m.users.deleteUser(user.id);
+    });
+
+    it("caps stored sessions and rejects sign-ins checked before a password change", async () => {
+        const user = await m.users.createUser("session-cap@example.com", "old-password-hash");
+        assert.ok(user);
+        const expires = new Date(Date.now() + 60_000);
+        for (let i = 0; i < 22; i++) {
+            assert.equal(await m.users.createSession(user.id, `session-cap-${i}`, expires, null, "old-password-hash"), true);
+        }
+        const stored = await m.db.getDatabase().all<{ token_hash: string }>("SELECT token_hash FROM sessions WHERE user_id = ? ORDER BY id", [user.id]);
+        assert.equal(stored.length, 20);
+        assert.equal(stored[0]!.token_hash, "session-cap-2");
+        await m.users.setPasswordHash(user.id, "new-password-hash");
+        assert.equal(await m.users.createSession(user.id, "stale-login", expires, null, "old-password-hash"), false);
+        assert.equal(await m.db.getDatabase().get("SELECT id FROM sessions WHERE token_hash = ?", ["stale-login"]), undefined);
+        await m.users.deleteUser(user.id);
+    });
+
     it("registers without signing anyone in, and only emails a confirmation link", async () => {
         const response = await request("POST", "/auth/register", { body: { email: "New.User@Example.com", password: PASSWORD } });
 
@@ -321,6 +363,15 @@ describe("login", () => {
         assert.equal(correct.status, 429, "the right password does not bypass the lock");
     });
 
+    it("limits concurrent password guesses before asynchronous verification finishes", async () => {
+        await signUp("parallel@example.com");
+        const replies = await Promise.all(Array.from({ length: 24 }, () => request("POST", "/auth/login", {
+            body: { email: "parallel@example.com", password: "wrong parallel password" },
+        })));
+        assert.equal(replies.filter((reply) => reply.status === 401).length, 8);
+        assert.equal(replies.filter((reply) => reply.status === 429).length, 16);
+    });
+
     it("lets one account's lockout leave other accounts alone, and a success reset the count", async () => {
         await signUp("busy@example.com");
         await signUp("other@example.com");
@@ -441,10 +492,12 @@ describe("cross-site protection", () => {
 const MOUNTS: Record<string, string> = {
     "auth.routes.ts": "/auth", "resume.routes.ts": "/resumes", "job.routes.ts": "/jobs",
     "candidate.routes.ts": "/candidates", "match.routes.ts": "/matches", "application.routes.ts": "/applications",
+    "admin.routes.ts": "/admin", "alert.routes.ts": "/alerts",
 };
 const PUBLIC = new Set([
     "POST /auth/register", "POST /auth/login", "POST /auth/logout",
     "POST /auth/verify-email", "POST /auth/forgot-password", "POST /auth/reset-password",
+    "POST /alerts/preview", "POST /alerts/act", "POST /alerts/unsubscribe",
 ]);
 
 function discoverEndpoints(): { method: string; path: string }[] {
@@ -456,7 +509,7 @@ function discoverEndpoints(): { method: string; path: string }[] {
         assert.ok(mount, `${file} is a new route file: add its mount point to MOUNTS in this test`);
 
         const source = readFileSync(join(directory, file), "utf8");
-        for (const match of source.matchAll(/router\.(get|post|put|patch|delete)\(\s*"([^"]*)"/g)) {
+        for (const match of source.matchAll(/(?:router|alertLinkRoutes|alertPreferenceRoutes)\.(get|post|put|patch|delete)\(\s*"([^"]*)"/g)) {
             const route = match[2] === "/" ? "" : match[2]!;
             found.push({ method: match[1]!.toUpperCase(), path: `${mount}${route}`.replace(/:\w+/g, "1") });
         }
@@ -470,6 +523,9 @@ describe("default deny", () => {
     it("finds the routes (so the checks below are not vacuous)", () => {
         assert.ok(endpoints.length >= 30, `only found ${endpoints.length} endpoints`);
         assert.ok(endpoints.some((e) => e.method === "GET" && e.path === "/candidates/1/resume"));
+        assert.ok(endpoints.some((e) => e.method === "GET" && e.path === "/admin/users"));
+        assert.ok(endpoints.some((e) => e.method === "GET" && e.path === "/alerts/preferences"));
+        assert.ok(endpoints.some((e) => e.method === "POST" && e.path === "/alerts/act"));
     });
 
     it("requires a session on every route except the few that must work before signing in", async () => {

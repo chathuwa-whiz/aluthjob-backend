@@ -1,5 +1,8 @@
 import { ollama } from "./ollama.client.js";
 import { KeyPool, parseKeys } from "./groq.keypool.js";
+import { WorkBudget } from "../security/work-budget.js";
+
+const modelBudget = new WorkBudget(4, "The model");
 
 /**
  * One entry point for every model call. With GROQ_API_KEYS set the request goes to Groq, spread over
@@ -69,6 +72,10 @@ export function llmStatus() {
 }
 
 export async function chat(request: ChatRequest, onChunk: OnChunk = () => {}): Promise<ChatResult> {
+    return modelBudget.run(() => performChat(request, onChunk));
+}
+
+async function performChat(request: ChatRequest, onChunk: OnChunk): Promise<ChatResult> {
     const keys = groqPool();
     if (!keys) return ollamaChat(request, onChunk);
 

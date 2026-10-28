@@ -1,4 +1,5 @@
 import { getDatabase, isUniqueViolation } from "../db/database.js";
+import { createHash } from "node:crypto";
 
 export type ApplicationStatus = "queued" | "sending" | "sent" | "failed" | "cancelled";
 
@@ -153,6 +154,11 @@ export async function requeue(id: number, error: string | null, notBefore: Date)
     await db().run("UPDATE applications SET status = 'queued', error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?", [cut(error, 4000), notBefore.toISOString(), now(), id]);
 }
 
+/** A pacing decision must never overwrite another worker's already claimed send. */
+export async function deferQueued(id: number, error: string | null, notBefore: Date): Promise<void> {
+    await db().run("UPDATE applications SET error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ? AND status = 'queued'", [cut(error, 4000), notBefore.toISOString(), now(), id]);
+}
+
 /** Only queued applications can be cancelled; once sending has started it cannot be taken back. */
 export async function cancel(id: number, reason: string | null = null): Promise<boolean> {
     return (await db().run("UPDATE applications SET status = 'cancelled', error = ?, updated_at = ? WHERE id = ? AND status = 'queued'", [cut(reason, 4000), now(), id])).changes === 1;
@@ -179,16 +185,74 @@ export async function lastSentAt(candidateId: number): Promise<Date | undefined>
     return row?.latest ? new Date(row.latest) : undefined;
 }
 
+const mailboxKey = (email: string) => createHash("sha256").update(email.trim().toLowerCase()).digest("hex");
+const smtpKey = (host: string, username: string) => createHash("sha256").update(host.trim().toLowerCase()).update("\0").update(username.trim().toLowerCase()).digest("hex");
+
+export type SendReservation = { kind: "claimed"; eventId: number; application: Application }
+    | { kind: "deferred"; reason: "daily" | "gap"; notBefore: Date }
+    | { kind: "stale" };
+
+/** Reserves a user's and mailbox's shared allowance and claims the application in one short transaction.
+ * The table lock serializes reservations across API processes, but is released before any SMTP I/O.
+ */
+export async function reserveSend(id: number, ownerId: number | null, email: string, at: Date, dailyLimit: number, gapMs: number, expectedMatchVersion?: string): Promise<SendReservation> {
+    return db().transaction(async (tx) => {
+        await tx.run("LOCK TABLE mail_send_events IN EXCLUSIVE MODE");
+        const application = await tx.get<ApplicationRow>("SELECT * FROM applications WHERE id = ?", [id]);
+        if (!application || application.status !== "queued") return { kind: "stale" };
+        const candidate = await tx.get<{ user_id: number | null }>("SELECT user_id FROM candidates WHERE id = ? FOR UPDATE", [application.candidate_id]);
+        const account = await tx.get<{ email: string; host: string; username: string }>("SELECT email, host, username FROM mail_accounts WHERE candidate_id = ?", [application.candidate_id]);
+        if (!candidate || candidate.user_id !== ownerId || !account || account.email.toLowerCase() !== email.toLowerCase()) return { kind: "stale" };
+        // Claiming marks the start of sending. An edit/rejection committed before that boundary
+        // must invalidate the prepared message rather than sending the stale approved copy.
+        if (expectedMatchVersion !== undefined) {
+            const match = await tx.get<{ status: string; updated_at: string }>("SELECT status, updated_at FROM matches WHERE id = ? FOR UPDATE", [application.match_id]);
+            if (!match || match.status !== "approved" || match.updated_at !== expectedMatchVersion) return { kind: "stale" };
+        }
+
+        const since = new Date(at.getTime() - 86_400_000).toISOString();
+        await tx.run("DELETE FROM mail_send_events WHERE started_at < ?", [since]);
+        // Upgrade existing installations without resetting the allowance for their recent sends.
+        const legacy = await tx.all<{ id: number; user_id: number | null; email: string; host: string; username: string; started_at: string }>(
+            `SELECT a.id, c.user_id, m.email, m.host, m.username, COALESCE(a.sent_at, a.updated_at) AS started_at
+             FROM applications a JOIN candidates c ON c.id = a.candidate_id JOIN mail_accounts m ON m.candidate_id = c.id
+             WHERE (a.sent_at >= ? OR (a.status = 'sending' AND a.updated_at >= ?))
+             AND NOT EXISTS (SELECT 1 FROM mail_send_events e WHERE e.application_id = a.id)`, [since, since]);
+        for (const previous of legacy) await tx.run("INSERT INTO mail_send_events (application_id, user_id, mailbox_key, smtp_key, status, started_at) VALUES (?, ?, ?, ?, 'sent', ?)", [previous.id, previous.user_id, mailboxKey(previous.email), smtpKey(previous.host, previous.username), previous.started_at]);
+
+        const key = mailboxKey(email);
+        const identity = smtpKey(account.host, account.username);
+        const usage = await tx.get<{ n: number; latest: string | null }>(
+            "SELECT COUNT(*) AS n, MAX(started_at) AS latest FROM mail_send_events WHERE (user_id = ? OR mailbox_key = ? OR smtp_key = ?) AND status IN ('sending', 'sent') AND started_at >= ?", [ownerId, key, identity, since]);
+        if (usage!.n >= dailyLimit) return { kind: "deferred", reason: "daily", notBefore: new Date(at.getTime() + 3_600_000) };
+        if (usage?.latest && at.getTime() - new Date(usage.latest).getTime() < gapMs) return { kind: "deferred", reason: "gap", notBefore: new Date(new Date(usage.latest).getTime() + gapMs) };
+
+        const claimed = await tx.run("UPDATE applications SET status = 'sending', attempts = attempts + 1, updated_at = ? WHERE id = ? AND status = 'queued'", [at.toISOString(), id]);
+        if (claimed.changes !== 1) return { kind: "stale" };
+        const eventId = await tx.insert("INSERT INTO mail_send_events (application_id, user_id, mailbox_key, smtp_key, status, started_at) VALUES (?, ?, ?, ?, 'sending', ?)", [id, ownerId, key, identity, at.toISOString()]);
+        return { kind: "claimed", eventId, application: toApplication({ ...application, status: "sending", attempts: application.attempts + 1, updated_at: at.toISOString() }) };
+    });
+}
+
+export async function finishSendReservation(eventId: number, sent: boolean): Promise<void> {
+    await db().run("UPDATE mail_send_events SET status = ? WHERE id = ?", [sent ? "sent" : "failed", eventId]);
+}
+
 /**
  * After a crash an application can be left in 'sending' with no way to know whether the mail
  * left the building. It is never retried automatically: the user is told to check the Sent
  * folder and can retry by hand.
  */
-export async function failInterrupted(): Promise<number> {
+export async function refreshSending(id: number): Promise<void> {
+    await db().run("UPDATE applications SET updated_at = ? WHERE id = ? AND status = 'sending'", [now(), id]);
+}
+
+export async function failInterrupted(staleBefore = new Date(Date.now() - 5 * 60_000)): Promise<number> {
     return (
-        await db().run("UPDATE applications SET status = 'failed', error = ?, updated_at = ? WHERE status = 'sending'", [
+        await db().run("UPDATE applications SET status = 'failed', error = ?, updated_at = ? WHERE status = 'sending' AND updated_at < ?", [
             "Interrupted while sending. Check the Sent folder of your mailbox before retrying, to avoid a duplicate.",
             now(),
+            staleBefore.toISOString(),
         ])
     ).changes;
 }

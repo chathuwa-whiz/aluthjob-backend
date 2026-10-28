@@ -13,7 +13,6 @@ const DAILY_LIMIT = () => Number(process.env.MAIL_DAILY_LIMIT ?? 20);
 const MIN_GAP_MS = () => Number(process.env.MAIL_SEND_GAP_SECONDS ?? 60) * 1000;
 const MAX_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = 10 * 60_000;
-const DAY_MS = 24 * 60 * 60_000;
 
 const EMAIL_RE = /^[a-z0-9._%+-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}$/i;
 
@@ -92,7 +91,7 @@ async function prepare(match: Match, to = match.job.applyEmail) {
         ],
     };
 
-    return { mail, account, file };
+    return { mail, account, file, candidate };
 }
 
 /** The exact message that would be sent, plus whatever currently blocks it. */
@@ -206,23 +205,12 @@ export async function processNext(now = new Date()): Promise<ProcessResult> {
     // Everything is re-checked at send time: the user may have rejected, edited or disconnected since queueing
     const match = await getMatch(due.matchId);
     const account = await getMailAccount(due.candidateId);
+    const originalOwner = await getCandidate(due.candidateId);
     const problems = match ? sendProblems(match, Boolean(account), account?.email) : ["The match no longer exists"];
 
     if (problems.length > 0 || match?.job.applyEmail?.toLowerCase() !== due.toEmail) {
         await applications.cancel(due.id, problems[0] ?? "The employer address changed after you queued this application");
         return "cancelled";
-    }
-
-    const sentToday = await applications.countSentSince(due.candidateId, new Date(now.getTime() - DAY_MS));
-    if (sentToday >= DAILY_LIMIT()) {
-        await applications.requeue(due.id, `Daily limit of ${DAILY_LIMIT()} applications reached; will continue tomorrow`, new Date(now.getTime() + 60 * 60_000));
-        return "deferred";
-    }
-
-    const last = await applications.lastSentAt(due.candidateId);
-    if (last && now.getTime() - last.getTime() < MIN_GAP_MS()) {
-        await applications.requeue(due.id, null, new Date(last.getTime() + MIN_GAP_MS()));
-        return "deferred";
     }
 
     let settings;
@@ -234,18 +222,33 @@ export async function processNext(now = new Date()): Promise<ProcessResult> {
         return "deferred";
     }
 
-    const claimed = await applications.claim(due.id);
-    if (!claimed) return "idle"; // another worker got there first
-
-    const { mail } = await prepare(match!, due.toEmail);
+    if (!settings) {
+        await applications.cancel(due.id, "Connect your mailbox first");
+        return "cancelled";
+    }
+    // Prepare before claiming so a missing CV never leaves an application stuck in 'sending'.
+    const { mail, account: preparedAccount } = await prepare(match!, due.toEmail);
+    if (!preparedAccount || preparedAccount.email.toLowerCase() !== settings.email.toLowerCase()) return "idle";
+    if (!originalOwner) return "idle";
+    const reservation = await applications.reserveSend(due.id, originalOwner.userId, settings.email, now, DAILY_LIMIT(), MIN_GAP_MS(), match!.updatedAt);
+    if (reservation.kind === "stale") return "idle";
+    if (reservation.kind === "deferred") {
+        await applications.deferQueued(due.id, reservation.reason === "daily" ? `Daily limit of ${DAILY_LIMIT()} applications reached; will continue tomorrow` : null, reservation.notBefore);
+        return "deferred";
+    }
+    const claimed = reservation.application;
     let messageId: string;
     let transport;
+    // A second worker may start while this SMTP connection is active. Keep its claim live,
+    // so crash recovery only marks genuinely abandoned sends for manual review.
+    const heartbeat = setInterval(() => void applications.refreshSending(claimed.id).catch(() => undefined), 60_000).unref();
 
     try {
         transport = await createTransport(settings);
         messageId = String((await transport.sendMail(mail)).messageId);
     } catch (error) {
         const failure = classifySmtpError(error);
+        await applications.finishSendReservation(reservation.eventId, false);
 
         if (failure.retryable && claimed.attempts < MAX_ATTEMPTS) {
             await applications.requeue(claimed.id, failure.message, new Date(Date.now() + RETRY_BACKOFF_MS * claimed.attempts));
@@ -255,11 +258,13 @@ export async function processNext(now = new Date()): Promise<ProcessResult> {
         await applications.markFailed(claimed.id, failure.message);
         return "failed";
     } finally {
+        clearInterval(heartbeat);
         transport?.close();
     }
 
     // Outside the try block on purpose: once the server has accepted the mail, a bookkeeping
     // problem must never make it look like a failed send that could be retried (a duplicate).
+    await applications.finishSendReservation(reservation.eventId, true);
     await applications.markSent(claimed.id, { messageId, subject: String(mail.subject), body: String(mail.text) });
     return "sent";
 }

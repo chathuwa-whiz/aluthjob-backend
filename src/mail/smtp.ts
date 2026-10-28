@@ -2,6 +2,7 @@ import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import nodemailer, { type Transporter } from "nodemailer";
 import { RuleError } from "../errors.js";
+import { isPublicAddress } from "../network/public-address.js";
 
 export interface SmtpSettings {
     host: string;
@@ -32,24 +33,7 @@ export function presetFor(email: string) {
 }
 
 // Development and tests talk to a mail catcher on localhost; production never sets this
-const allowLocal = () => process.env.MAIL_ALLOW_LOCAL === "true";
-
-function isPrivateAddress(address: string): boolean {
-    const ip = address.toLowerCase().replace(/^::ffff:/, "");
-
-    if (isIP(ip) === 4) {
-        const [a, b] = ip.split(".").map(Number) as [number, number];
-        return (
-            a === 0 || a === 10 || a === 127 || a >= 224 ||
-            (a === 100 && b >= 64 && b <= 127) ||
-            (a === 169 && b === 254) ||
-            (a === 172 && b >= 16 && b <= 31) ||
-            (a === 192 && b === 168)
-        );
-    }
-
-    return ip === "::1" || ip === "::" || ip.startsWith("fc") || ip.startsWith("fd") || ip.startsWith("fe80");
-}
+const allowLocal = () => process.env.NODE_ENV !== "production" && process.env.MAIL_ALLOW_LOCAL === "true";
 
 /**
  * Resolves the host once and refuses internal addresses. The connection is then made to the
@@ -63,7 +47,7 @@ async function resolveSafely(host: string, port: number): Promise<string> {
     const addresses = isIP(host) ? [{ address: host }] : await lookup(host, { all: true }).catch(() => []);
     if (addresses.length === 0) throw new RuleError(`Could not find the mail server "${host}"`);
 
-    if (!allowLocal() && addresses.some(({ address }) => isPrivateAddress(address))) {
+    if (!allowLocal() && addresses.some(({ address }) => !isPublicAddress(address))) {
         throw new RuleError("The mail server must be a public address");
     }
 

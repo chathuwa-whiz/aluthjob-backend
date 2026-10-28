@@ -1,6 +1,10 @@
 import { getJob, listUnenriched, recordEnrichmentFailure, saveEnrichment, upsertJobs } from "./job.repository.js";
 import { sourceIds, sources } from "./sources/index.js";
 import type { JobSourceId } from "./types.js";
+import { SingleFlight, WorkBudget } from "../security/work-budget.js";
+
+const enrichments = new SingleFlight<Awaited<ReturnType<typeof getJob>>>();
+const enrichmentBudget = new WorkBudget(4, "Reading adverts");
 
 export interface IngestResult {
     source: JobSourceId;
@@ -46,6 +50,10 @@ export async function ingestAll(ids: JobSourceId[] = sourceIds, maxPages = DEFAU
 
 /** Loads the detail page of one stored vacancy (description, apply email) if not done yet. */
 export async function enrichJob(id: number) {
+    return enrichments.run(id, () => enrichmentBudget.run(() => loadEnrichedJob(id)));
+}
+
+async function loadEnrichedJob(id: number) {
     const job = await getJob(id);
     if (!job) return undefined;
 
@@ -77,7 +85,7 @@ export async function enrichPending(id: JobSourceId, limit: number): Promise<Enr
         result.attempted++;
 
         try {
-            await saveEnrichment(job.id, await source.enrich(job));
+            await enrichJob(job.id);
             result.enriched++;
         } catch (error) {
             await recordEnrichmentFailure(job.id).catch(() => {});

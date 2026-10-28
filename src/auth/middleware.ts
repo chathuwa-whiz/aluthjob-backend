@@ -81,7 +81,7 @@ export function sessionCookieOptions(): CookieOptions {
     return {
         httpOnly: true, // not readable by page scripts, so an XSS bug cannot steal the session
         sameSite: "lax", // not sent on cross-site POSTs
-        secure: process.env.COOKIE_SECURE ? process.env.COOKIE_SECURE === "true" : process.env.NODE_ENV === "production",
+        secure: process.env.NODE_ENV === "production" || process.env.COOKIE_SECURE === "true",
         path: "/",
         maxAge: Number(process.env.SESSION_DAYS ?? 30) * 24 * 60 * 60 * 1000,
     };

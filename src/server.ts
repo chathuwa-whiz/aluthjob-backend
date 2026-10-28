@@ -6,7 +6,9 @@ import { enrichPending } from "./jobs/ingest.service.js";
 import { closeDatabase } from "./db/database.js";
 import { startMailWorker } from "./mail/worker.js";
 import { runAlertCycle } from "./alerts/alert.service.js";
+import { assertProductionSecurity } from "./auth/config.js";
 
+assertProductionSecurity();
 const port = Number(process.env.PORT ?? 4000);
 
 const server = app.listen(port, "0.0.0.0", () => {

@@ -60,6 +60,7 @@ function smtpMailer(): SystemMailer {
             host: process.env.SYSTEM_SMTP_HOST,
             port,
             secure,
+            requireTLS: isProduction() && !secure,
             ...(user && { auth: { user, pass: process.env.SYSTEM_SMTP_PASS ?? "" } }),
             connectionTimeout: 15_000,
             greetingTimeout: 15_000,

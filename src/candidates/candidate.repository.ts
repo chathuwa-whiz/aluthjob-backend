@@ -1,4 +1,5 @@
 import { getDatabase } from "../db/database.js";
+import { RuleError } from "../errors.js";
 import type { Resume } from "../schemas/resume.schema.js";
 
 export interface Candidate {
@@ -88,7 +89,26 @@ export async function listCandidatesOf(userId: number): Promise<Candidate[]> {
 
 /** Administrators only: moves a resume to another account (or to nobody). */
 export async function setCandidateOwner(candidateId: number, userId: number | null): Promise<boolean> {
-    return (await getDatabase().run("UPDATE candidates SET user_id = ?, updated_at = ? WHERE id = ?", [userId, new Date().toISOString(), candidateId])).changes === 1;
+    return changeCandidateOwner(candidateId, userId);
+}
+
+async function changeCandidateOwner(candidateId: number, userId: number | null, onlyUnowned = false): Promise<boolean> {
+    return getDatabase().transaction(async (tx) => {
+        // Mailbox saves and send claims take this same short row lock. Ownership never changes
+        // while an SMTP send is in progress, and credentials cannot be saved across a transfer.
+        const candidate = await tx.get<{ user_id: number | null }>("SELECT user_id FROM candidates WHERE id = ? FOR UPDATE", [candidateId]);
+        if (!candidate) return false;
+        if (onlyUnowned && candidate.user_id !== null) return false;
+        if (candidate.user_id === userId) return true;
+        const sending = await tx.get<{ n: number }>("SELECT COUNT(*) AS n FROM applications WHERE candidate_id = ? AND status = 'sending'", [candidateId]);
+        if (sending!.n > 0) throw new RuleError("Wait for the application being sent before changing this resume's owner");
+        const at = new Date().toISOString();
+        await tx.run("DELETE FROM mail_accounts WHERE candidate_id = ?", [candidateId]);
+        await tx.run("UPDATE applications SET status = 'cancelled', error = ?, updated_at = ? WHERE candidate_id = ? AND status IN ('queued', 'failed')", ["Resume ownership changed; connect a mailbox and approve again before sending", at, candidateId]);
+        await tx.run("UPDATE matches SET status = CASE WHEN status = 'approved' THEN 'suggested' ELSE status END, confirmed_email = NULL, updated_at = ? WHERE candidate_id = ?", [at, candidateId]);
+        await tx.run("UPDATE candidates SET user_id = ?, updated_at = ? WHERE id = ?", [userId, at, candidateId]);
+        return true;
+    });
 }
 
 /** Deletes the resume with its matches, mailbox and applications (ON DELETE CASCADE). */
@@ -98,5 +118,5 @@ export async function deleteCandidate(candidateId: number): Promise<boolean> {
 
 /** Gives an ownerless (pre-accounts) resume to a user. Used by the `assign-candidate` script, never by the API. */
 export async function assignCandidateOwner(candidateId: number, userId: number): Promise<boolean> {
-    return (await getDatabase().run("UPDATE candidates SET user_id = ? WHERE id = ? AND user_id IS NULL", [userId, candidateId])).changes === 1;
+    return changeCandidateOwner(candidateId, userId, true);
 }

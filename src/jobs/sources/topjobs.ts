@@ -1,7 +1,7 @@
 import * as cheerio from "cheerio";
 import { cleanOcrText, pickTrustedEmail } from "../../ocr/ocr-email.js";
 import { recognizeImage, type OcrResult } from "../../ocr/ocr.service.js";
-import { getText, request } from "../http.js";
+import { getText, request, ResponseTooLargeError } from "../http.js";
 import { absoluteUrl, htmlToText, pickApplyEmail, squash, toIsoDate } from "../text.js";
 import type { JobPosting, JobSource } from "../types.js";
 
@@ -123,14 +123,13 @@ async function readAdImages(urls: string[]): Promise<OcrResult[]> {
     const results: OcrResult[] = [];
 
     for (const url of urls) {
-        const response = await request(url);
-        const length = Number(response.headers.get("content-length") ?? 0);
-        if (length > MAX_IMAGE_BYTES) continue;
-
-        const image = Buffer.from(await response.arrayBuffer());
-        if (image.length > MAX_IMAGE_BYTES) continue;
-
-        results.push(await recognizeImage(image));
+        try {
+            const response = await request(url, {}, MAX_IMAGE_BYTES);
+            const image = Buffer.from(await response.arrayBuffer());
+            results.push(await recognizeImage(image));
+        } catch (error) {
+            if (!(error instanceof ResponseTooLargeError)) throw error;
+        }
     }
 
     return results;

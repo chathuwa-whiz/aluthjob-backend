@@ -6,6 +6,16 @@ import { listJobs, type StoredJob } from "../jobs/job.repository.js";
 import { buildSubject, draftCoverLetter } from "./cover-letter.service.js";
 import { getMatch, listMatches, saveConfirmedEmail, saveDraft, saveMatches, setStatus, type Match, type NewMatch } from "./match.repository.js";
 import { buildCorpus, buildProfileModel, scoreJob } from "./scoring.js";
+import { RateLimiter } from "../auth/rate-limit.js";
+import { SingleFlight, WorkBudget } from "../security/work-budget.js";
+
+const letters = new SingleFlight<Match>();
+const letterBudget = new WorkBudget(4, "Writing letters");
+const letterLimits = new RateLimiter(30, 60 * 60_000, "cover letters");
+const matchingBudget = new WorkBudget(2, "Matching");
+const matchingLimits = new RateLimiter(10, 60 * 60_000, "job searches");
+
+export function resetWorkLimits(): void { letterLimits.reset(); matchingLimits.reset(); }
 
 export interface MatchRunOptions {
     /** Suggestions scoring below this are not stored. */
@@ -56,6 +66,21 @@ export async function runMatching(
     candidateId: number,
     overrides: Partial<MatchRunOptions> = {},
     report: (event: RunEvent) => void = () => {},
+): Promise<MatchRunSummary> {
+    return matchingBudget.run(async () => {
+        const candidate = await getCandidate(candidateId);
+        if (!candidate) throw new NotFoundError("Candidate not found");
+        const key = String(candidate.userId ?? `candidate:${candidate.id}`);
+        matchingLimits.assertAllowed(key);
+        matchingLimits.record(key);
+        return performMatching(candidateId, overrides, report);
+    });
+}
+
+async function performMatching(
+    candidateId: number,
+    overrides: Partial<MatchRunOptions>,
+    report: (event: RunEvent) => void,
 ): Promise<MatchRunSummary> {
     const options = { ...DEFAULT_RUN_OPTIONS, ...overrides };
 
@@ -137,12 +162,19 @@ export async function runMatching(
 
 /** (Re)writes the cover letter of a suggestion. Any earlier approval is withdrawn by the repository. */
 export async function writeCoverLetter(matchId: number): Promise<Match> {
+    return letters.run(matchId, () => letterBudget.run(() => generateCoverLetter(matchId)));
+}
+
+async function generateCoverLetter(matchId: number): Promise<Match> {
     const match = await getMatch(matchId);
     if (!match) throw new NotFoundError("Match not found");
 
     const candidate = await getCandidate(match.candidateId);
     if (!candidate) throw new NotFoundError("Candidate not found");
 
+    const key = String(candidate.userId ?? `candidate:${candidate.id}`);
+    letterLimits.assertAllowed(key);
+    letterLimits.record(key);
     const letter = await draftCoverLetter(candidate.profile, match.job, match.details.matchedSkills);
     await saveDraft(matchId, letter.subject, letter.text);
 

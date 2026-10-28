@@ -119,6 +119,7 @@ beforeEach(() => {
 const MOUNTS: Record<string, string> = {
     "resume.routes.ts": "/resumes", "job.routes.ts": "/jobs", "candidate.routes.ts": "/candidates",
     "match.routes.ts": "/matches", "application.routes.ts": "/applications",
+    "admin.routes.ts": "/admin", "alert.routes.ts": "/alerts",
 };
 
 function dataEndpoints(): { method: string; path: string }[] {
@@ -126,7 +127,8 @@ function dataEndpoints(): { method: string; path: string }[] {
     const found: { method: string; path: string }[] = [];
 
     for (const [file, mount] of Object.entries(MOUNTS)) {
-        for (const match of readFileSync(join(directory, file), "utf8").matchAll(/router\.(get|post|put|patch|delete)\(\s*"([^"]*)"/g)) {
+        // Alert links authenticate with their signed token; alert preferences require verification.
+        for (const match of readFileSync(join(directory, file), "utf8").matchAll(/(?:router|alertPreferenceRoutes)\.(get|post|put|patch|delete)\(\s*"([^"]*)"/g)) {
             found.push({ method: match[1]!.toUpperCase(), path: `${mount}${match[2] === "/" ? "" : match[2]}`.replace(/:\w+/g, "1") });
         }
     }
@@ -144,6 +146,8 @@ describe("email verification", () => {
 
         const endpoints = dataEndpoints();
         assert.ok(endpoints.length >= 25);
+        assert.ok(endpoints.some((endpoint) => endpoint.path === "/admin/users"));
+        assert.ok(endpoints.some((endpoint) => endpoint.path === "/alerts/preferences"));
         for (const { method, path } of endpoints) {
             const response = await request(method, path, { cookie: user.cookie, ...(method !== "GET" && method !== "DELETE" && { body: {} }) });
             assert.equal(response.status, 403, `${method} ${path} -> ${response.status}`);

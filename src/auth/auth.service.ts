@@ -31,6 +31,7 @@ const RESET_MINUTES = 60;
 export const limits = {
     loginPerAccount: new RateLimiter(8, 15 * MINUTE, "failed sign-in attempts"),
     loginPerAddress: new RateLimiter(40, 15 * MINUTE, "failed sign-in attempts"),
+    loginStarts: new RateLimiter(120, 15 * MINUTE, "sign-in requests"),
     registerPerAddress: new RateLimiter(10, HOUR, "sign-ups from this address"),
     sensitivePerUser: new RateLimiter(5, 15 * MINUTE, "failed confirmations"),
     // email: a signed-in user asking for another confirmation link
@@ -46,9 +47,11 @@ export const limits = {
 export const normalizeEmail = (email: string) => email.trim().toLowerCase();
 const hashToken = (token: string) => createHash("sha256").update(token).digest("hex");
 
-async function issueSession(userId: number, context: RequestContext): Promise<string> {
+async function issueSession(userId: number, context: RequestContext, passwordHash: string): Promise<string> {
     const token = randomBytes(32).toString("base64url");
-    await users.createSession(userId, hashToken(token), new Date(Date.now() + sessionMs()), context.userAgent);
+    if (!(await users.createSession(userId, hashToken(token), new Date(Date.now() + sessionMs()), context.userAgent, passwordHash))) {
+        throw new UnauthorizedError("Your password changed. Sign in again");
+    }
     return token;
 }
 
@@ -112,19 +115,23 @@ export async function register(emailInput: string, password: string, context: Re
 
 /** Confirms an address from the emailed link. Single use. Does not sign anyone in. */
 export async function verifyEmail(token: string, context: RequestContext): Promise<void> {
-    limits.badLinkPerAddress.assertAllowed(context.ip);
+    const attempt = limits.badLinkPerAddress.reserve(context.ip);
 
-    const used = await consumeEmailToken("verify", token);
-    const user = used && (await users.getUser(used.userId));
+    try {
+        const used = await consumeEmailToken("verify", token);
+        const user = used && (await users.getUser(used.userId));
 
-    // a link only counts for the address it was sent to
-    if (!used || !user || user.email !== used.email) {
-        limits.badLinkPerAddress.record(context.ip);
-        throw new BadRequestError("This confirmation link is invalid or has expired. Sign in and ask for a new one");
+        // a link only counts for the address it was sent to
+        if (!used || !user || user.email !== used.email) {
+            attempt(false);
+            throw new BadRequestError("This confirmation link is invalid or has expired. Sign in and ask for a new one");
+        }
+
+        await users.markEmailVerified(user.id);
+        await revokeEmailTokens(user.id, "verify");
+    } finally {
+        attempt(true);
     }
-
-    await users.markEmailVerified(user.id);
-    await revokeEmailTokens(user.id, "verify");
 }
 
 /** A signed-in but unverified user asking for a fresh link (the old one stops working). */
@@ -144,24 +151,41 @@ export async function login(emailInput: string, password: string, context: Reque
     const email = normalizeEmail(emailInput);
     const accountKey = `${context.ip}|${email}`;
 
-    limits.loginPerAccount.assertAllowed(accountKey);
-    limits.loginPerAddress.assertAllowed(context.ip);
+    limits.loginStarts.assertAllowed(context.ip);
+    limits.loginStarts.record(context.ip);
+    const accountAttempt = limits.loginPerAccount.reserve(accountKey);
+    let addressAttempt: ReturnType<RateLimiter["reserve"]>;
+    try {
+        addressAttempt = limits.loginPerAddress.reserve(context.ip);
+    } catch (error) {
+        accountAttempt(true);
+        throw error;
+    }
 
-    const found = await users.findUserWithHash(email);
-    // Always do the expensive comparison, even for an unknown address, so timing does not reveal which emails have accounts
-    const correct = await verifyPassword(password, found?.passwordHash ?? (await decoyHash()));
+    let correct = false;
+    let found: Awaited<ReturnType<typeof users.findUserWithHash>>;
+    try {
+        found = await users.findUserWithHash(email);
+        // Always compare, even for unknown addresses, to avoid revealing accounts through timing.
+        correct = await verifyPassword(password, found?.passwordHash ?? (await decoyHash()));
+    } catch (error) {
+        accountAttempt(true);
+        addressAttempt(true);
+        throw error;
+    }
 
     if (!found || !correct) {
-        limits.loginPerAccount.record(accountKey);
-        limits.loginPerAddress.record(context.ip);
+        accountAttempt(false);
+        addressAttempt(false);
         throw new UnauthorizedError("Incorrect email or password");
     }
 
-    limits.loginPerAccount.clear(accountKey);
+    accountAttempt(true, true);
+    addressAttempt(true);
     await users.touchLogin(found.id);
 
     const { passwordHash: _passwordHash, ...user } = found;
-    return { user, token: await issueSession(found.id, context) };
+    return { user, token: await issueSession(found.id, context, found.passwordHash) };
 }
 
 export const logout = (token: string) => users.deleteSession(hashToken(token));
@@ -171,26 +195,36 @@ export const authenticate = (token: string) => users.findSessionUser(hashToken(t
 
 // ---- passwords -------------------------------------------------------------------------
 
-async function confirmPassword(userId: number, password: string): Promise<void> {
-    limits.sensitivePerUser.assertAllowed(String(userId));
+async function confirmPassword(userId: number, password: string): Promise<string> {
+    const attempt = limits.sensitivePerUser.reserve(String(userId));
 
-    const stored = await users.getPasswordHash(userId);
-    if (!stored || !(await verifyPassword(password, stored))) {
-        limits.sensitivePerUser.record(String(userId));
-        throw new UnauthorizedError("Incorrect password");
+    try {
+        const stored = await users.getPasswordHash(userId);
+        if (!stored || !(await verifyPassword(password, stored))) {
+            attempt(false);
+            throw new UnauthorizedError("Incorrect password");
+        }
+
+        attempt(true, true);
+        return stored;
+    } catch (error) {
+        attempt(true);
+        throw error;
     }
-
-    limits.sensitivePerUser.clear(String(userId));
 }
 
 /** Changes the password and signs the account out everywhere else, in case the old password was stolen. */
 export async function changePassword(user: users.User, current: string, next: string, currentToken: string): Promise<void> {
-    await confirmPassword(user.id, current);
+    const confirmedHash = await confirmPassword(user.id, current);
     assertAcceptablePassword(next, user.email);
 
-    await users.setPasswordHash(user.id, await hashPassword(next));
-    await users.deleteSessionsOf(user.id, hashToken(currentToken));
-    await revokeEmailTokens(user.id, "reset");
+    const nextHash = await hashPassword(next);
+    await users.withUserLock(user.id, async (tx) => {
+        if ((await users.getPasswordHash(user.id, tx)) !== confirmedHash) throw new UnauthorizedError("Your password changed. Sign in again");
+        await users.setPasswordHash(user.id, nextHash, tx);
+        await users.deleteSessionsOf(user.id, hashToken(currentToken), tx);
+        await revokeEmailTokens(user.id, "reset", tx);
+    });
 
     // so the owner hears about it even if someone else did this with a hijacked session
     sendInBackground(async () => passwordChangedMessage(user.email, "change"));
@@ -219,36 +253,46 @@ export async function requestPasswordReset(emailInput: string, context: RequestC
  * owner reads this mailbox, the address counts as verified.
  */
 export async function resetPassword(token: string, newPassword: string, context: RequestContext): Promise<void> {
-    limits.badLinkPerAddress.assertAllowed(context.ip);
+    const attempt = limits.badLinkPerAddress.reserve(context.ip);
 
     const invalid = () => {
-        limits.badLinkPerAddress.record(context.ip);
+        attempt(false);
         return new BadRequestError("This reset link is invalid or has expired. Request a new one");
     };
 
-    const pending = await peekEmailToken("reset", token);
-    if (!pending) throw invalid();
+    try {
+        const pending = await peekEmailToken("reset", token);
+        if (!pending) throw invalid();
 
-    // checked before the link is spent: a too-weak password must not cost the user their only link
-    assertAcceptablePassword(newPassword, pending.email);
-    const hash = await hashPassword(newPassword);
+        // checked before the link is spent: a too-weak password must not cost the user their only link
+        assertAcceptablePassword(newPassword, pending.email);
+        const hash = await hashPassword(newPassword);
 
-    const used = await consumeEmailToken("reset", token);
-    const user = used && (await users.getUser(used.userId));
-    if (!used || !user || user.email !== used.email) throw invalid();
+        const user = await users.getUser(pending.userId);
+        if (!user || user.email !== pending.email) throw invalid();
 
-    await users.setPasswordHash(user.id, hash);
-    await users.markEmailVerified(user.id);
-    await users.deleteSessionsOf(user.id);
-    await revokeEmailTokens(user.id, "reset");
+        await users.withUserLock(user.id, async (tx) => {
+            const used = await consumeEmailToken("reset", token, tx);
+            if (!used || used.userId !== user.id || used.email !== user.email) throw invalid();
+            await users.setPasswordHash(user.id, hash, tx);
+            await users.markEmailVerified(user.id, tx);
+            await users.deleteSessionsOf(user.id, undefined, tx);
+            await revokeEmailTokens(user.id, "reset", tx);
+        });
 
-    sendInBackground(async () => passwordChangedMessage(user.email, "reset"));
+        sendInBackground(async () => passwordChangedMessage(user.email, "reset"));
+    } finally {
+        attempt(true);
+    }
 }
 
 /** Permanently removes the account and every resume, match, mailbox and application that belongs to it. */
 export async function deleteAccount(user: users.User, password: string): Promise<void> {
-    await confirmPassword(user.id, password);
-    await users.deleteUser(user.id);
+    const confirmedHash = await confirmPassword(user.id, password);
+    await users.withUserLock(user.id, async (tx) => {
+        if ((await users.getPasswordHash(user.id, tx)) !== confirmedHash) throw new UnauthorizedError("Your password changed. Sign in again");
+        await users.deleteUser(user.id, tx);
+    });
 }
 
 export const purgeExpiredSessions = users.purgeExpiredSessions;

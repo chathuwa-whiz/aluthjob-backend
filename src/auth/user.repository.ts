@@ -1,4 +1,4 @@
-import { getDatabase, isUniqueViolation } from "../db/database.js";
+import { getDatabase, isUniqueViolation, type Db } from "../db/database.js";
 
 export type Role = "user" | "admin";
 
@@ -57,18 +57,18 @@ export async function findUserWithHash(email: string): Promise<(User & { passwor
     return row && { ...toUser(row), passwordHash: row.password_hash };
 }
 
-export async function getPasswordHash(id: number): Promise<string | undefined> {
-    const row = await db().get<{ password_hash: string }>("SELECT password_hash FROM users WHERE id = ?", [id]);
+export async function getPasswordHash(id: number, tx: Db = db()): Promise<string | undefined> {
+    const row = await tx.get<{ password_hash: string }>("SELECT password_hash FROM users WHERE id = ?", [id]);
     return row?.password_hash;
 }
 
-export async function setPasswordHash(id: number, passwordHash: string): Promise<void> {
-    await db().run("UPDATE users SET password_hash = ? WHERE id = ?", [passwordHash, id]);
+export async function setPasswordHash(id: number, passwordHash: string, tx: Db = db()): Promise<void> {
+    await tx.run("UPDATE users SET password_hash = ? WHERE id = ?", [passwordHash, id]);
 }
 
 /** Idempotent: the first verification time is kept. */
-export async function markEmailVerified(id: number): Promise<void> {
-    await db().run("UPDATE users SET email_verified_at = COALESCE(email_verified_at, ?) WHERE id = ?", [now(), id]);
+export async function markEmailVerified(id: number, tx: Db = db()): Promise<void> {
+    await tx.run("UPDATE users SET email_verified_at = COALESCE(email_verified_at, ?) WHERE id = ?", [now(), id]);
 }
 
 export async function setRole(id: number, role: Role): Promise<void> {
@@ -80,17 +80,40 @@ export async function touchLogin(id: number): Promise<void> {
 }
 
 /** Deletes the user; their sessions, resumes, matches, mailbox and applications go with them (ON DELETE CASCADE). */
-export async function deleteUser(id: number): Promise<boolean> {
-    return (await db().run("DELETE FROM users WHERE id = ?", [id])).changes > 0;
+export async function deleteUser(id: number, tx: Db = db()): Promise<boolean> {
+    return (await tx.run("DELETE FROM users WHERE id = ?", [id])).changes > 0;
+}
+
+/** Serializes credential changes, session creation and token issuance across API processes. */
+export async function withUserLock<T>(userId: number, work: (tx: Db) => Promise<T>): Promise<T> {
+    return db().transaction(async (tx) => {
+        await tx.get("SELECT id FROM users WHERE id = ? FOR UPDATE", [userId]);
+        return work(tx);
+    });
 }
 
 // ---- sessions --------------------------------------------------------------------------
 
-export async function createSession(userId: number, tokenHash: string, expiresAt: Date, userAgent: string | null): Promise<void> {
-    await db().run(
-        "INSERT INTO sessions (user_id, token_hash, created_at, expires_at, user_agent) VALUES (?, ?, ?, ?, ?)",
-        [userId, tokenHash, now(), expiresAt.toISOString(), userAgent?.slice(0, 200) ?? null],
-    );
+export async function createSession(userId: number, tokenHash: string, expiresAt: Date, userAgent: string | null, expectedPasswordHash?: string): Promise<boolean> {
+    return db().transaction(async (tx) => {
+        // Serialize concurrent sign-ins across processes; retain the newest twenty devices.
+        const user = await tx.get<{ password_hash: string }>("SELECT password_hash FROM users WHERE id = ? FOR UPDATE", [userId]);
+        // A password reset/change may have completed while the expensive comparison was running.
+        if (!user || (expectedPasswordHash !== undefined && user.password_hash !== expectedPasswordHash)) return false;
+        await tx.run("DELETE FROM sessions WHERE user_id = ? AND expires_at <= ?", [userId, now()]);
+        await tx.run(
+            "INSERT INTO sessions (user_id, token_hash, created_at, expires_at, user_agent) VALUES (?, ?, ?, ?, ?)",
+            [userId, tokenHash, now(), expiresAt.toISOString(), userAgent?.slice(0, 200) ?? null],
+        );
+        await tx.run(
+            `DELETE FROM sessions WHERE id IN (
+                SELECT id FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY id DESC) AS position FROM sessions WHERE user_id = ?)
+                WHERE position > 20
+            )`,
+            [userId],
+        );
+        return true;
+    });
 }
 
 /** The user behind a live (not expired) session. */
@@ -109,10 +132,10 @@ export async function deleteSession(tokenHash: string): Promise<void> {
 }
 
 /** Signs a user out everywhere, optionally keeping the session they are using right now. */
-export async function deleteSessionsOf(userId: number, exceptTokenHash?: string): Promise<number> {
+export async function deleteSessionsOf(userId: number, exceptTokenHash?: string, tx: Db = db()): Promise<number> {
     const result = exceptTokenHash
-        ? await db().run("DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?", [userId, exceptTokenHash])
-        : await db().run("DELETE FROM sessions WHERE user_id = ?", [userId]);
+        ? await tx.run("DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?", [userId, exceptTokenHash])
+        : await tx.run("DELETE FROM sessions WHERE user_id = ?", [userId]);
 
     return result.changes;
 }

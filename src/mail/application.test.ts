@@ -259,6 +259,76 @@ describe("queueing", () => {
 });
 
 describe("sending", () => {
+    it("revokes mailbox authority and outstanding approval when ownership changes", async () => {
+        const match = await approvedMatch();
+        const { application } = await m.service.queueMatch(match.id);
+        const owner = (await m.candidates.getCandidate(candidateId))!.userId!;
+        const next = (await m.users.createUser("new-owner@applicant.test", "not-a-real-hash"))!;
+        await m.candidates.setCandidateOwner(candidateId, next.id);
+        assert.equal(await m.accountRepo.getMailAccount(candidateId), undefined);
+        assert.equal((await m.apps.getApplication(application.id))!.status, "cancelled");
+        assert.equal((await m.matches.getMatch(match.id))!.status, "suggested");
+        assert.equal(await m.service.processNext(), "idle");
+        // A verification started by the former owner must not recreate that mailbox after transfer.
+        await assert.rejects(m.accountRepo.saveMailAccount({ candidateId, email: LOGIN.user, password: LOGIN.pass, host: "127.0.0.1", port, secure: false, username: LOGIN.user, fromName: null }, owner), /Candidate not found/);
+        assert.equal(await m.accountRepo.getMailAccount(candidateId), undefined);
+    });
+
+    it("keeps the mailbox when assigning the same owner and refuses transfers during a send", async () => {
+        const owner = (await m.candidates.getCandidate(candidateId))!.userId!;
+        await m.candidates.setCandidateOwner(candidateId, owner);
+        assert.ok(await m.accountRepo.getMailAccount(candidateId));
+        const { application } = await m.service.queueMatch((await approvedMatch()).id);
+        await m.apps.claim(application.id);
+        await assert.rejects(m.candidates.setCandidateOwner(candidateId, null), /being sent/);
+        assert.equal((await m.candidates.getCandidate(candidateId))!.userId, owner);
+        assert.ok(await m.accountRepo.getMailAccount(candidateId));
+    });
+
+    it("shares the daily allowance across resumes and accounts using the same mailbox", async () => {
+        process.env.MAIL_DAILY_LIMIT = "1";
+        await m.service.queueMatch((await approvedMatch()).id);
+        assert.equal(await m.service.processNext(), "sent");
+        const other = (await m.users.createUser("other@applicant.test", "not-a-real-hash"))!;
+        candidateId = (await m.candidates.createCandidate({ userId: other.id, hash: `hash-${++counter}`, fileName: "Other CV.pdf", mimeType: "application/pdf", fileData: CV, profile: profile as never })).id;
+        await connect();
+        await m.service.queueMatch((await approvedMatch()).id);
+        assert.equal(await m.service.processNext(), "deferred");
+        assert.equal(received.length, 1);
+    });
+
+    it("counts every explicit resend rather than just the reused application row", async () => {
+        process.env.MAIL_DAILY_LIMIT = "2";
+        const match = await approvedMatch();
+        await m.service.queueMatch(match.id);
+        assert.equal(await m.service.processNext(), "sent");
+        await m.service.queueMatch(match.id, { again: true });
+        assert.equal(await m.service.processNext(), "sent");
+        await m.service.queueMatch(match.id, { again: true });
+        assert.equal(await m.service.processNext(), "deferred");
+        assert.equal(received.length, 2);
+    });
+
+    it("shares SMTP login allowance even if separate accounts choose different From addresses", async () => {
+        process.env.MAIL_DAILY_LIMIT = "1";
+        await m.service.queueMatch((await approvedMatch()).id);
+        assert.equal(await m.service.processNext(), "sent");
+        const other = (await m.users.createUser("alias-owner@applicant.test", "not-a-real-hash"))!;
+        candidateId = (await m.candidates.createCandidate({ userId: other.id, hash: `hash-${++counter}`, fileName: "Alias CV.pdf", mimeType: "application/pdf", fileData: CV, profile: profile as never })).id;
+        await connect({ email: "different-from@applicant.test", username: LOGIN.user });
+        await m.service.queueMatch((await approvedMatch()).id);
+        assert.equal(await m.service.processNext(), "deferred");
+        assert.equal(received.length, 1);
+    });
+
+    it("reserves a shared allowance atomically for different applications", async () => {
+        const a = (await m.service.queueMatch((await approvedMatch()).id)).application;
+        const b = (await m.service.queueMatch((await approvedMatch()).id)).application;
+        const owner = (await m.candidates.getCandidate(candidateId))!.userId!;
+        const outcomes = await Promise.all([a, b].map((application) => m.apps.reserveSend(application.id, owner, LOGIN.user, new Date(), 1, 0)));
+        assert.equal(outcomes.filter((result) => result.kind === "claimed").length, 1);
+        assert.equal(outcomes.filter((result) => result.kind === "deferred").length, 1);
+    });
     it("delivers the letter with the CV attached, exactly once", async () => {
         const match = await approvedMatch({ email: "Recruiter@Employer.test" });
         const { application } = await m.service.queueMatch(match.id);
@@ -414,7 +484,8 @@ describe("sending", () => {
     it("never retries an application that was interrupted mid-send", async () => {
         const { application } = await m.service.queueMatch((await approvedMatch()).id);
         assert.ok(await m.apps.claim(application.id)); // worker "crashes" right after claiming
-
+        assert.equal(await m.apps.failInterrupted(), 0, "a live claim may belong to another worker");
+        await m.db.getDatabase().run("UPDATE applications SET updated_at = ? WHERE id = ?", [new Date(Date.now() - 6 * 60_000).toISOString(), application.id]);
         assert.equal(await m.apps.failInterrupted(), 1);
         const stored = (await m.apps.getApplication(application.id))!;
         assert.equal(stored.status, "failed");

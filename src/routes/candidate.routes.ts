@@ -94,7 +94,7 @@ const MailboxBody = z.object({
 router.put("/:id/mail-account", async (req, res) => {
     const candidate = await ownedCandidate(currentUser(req), req.params.id);
 
-    res.json({ success: true, data: await connectMailbox(candidate.id, MailboxBody.parse(req.body)) });
+    res.json({ success: true, data: await connectMailbox(candidate.id, MailboxBody.parse(req.body), currentUser(req).id) });
 });
 
 router.get("/:id/mail-account", async (req, res) => {
