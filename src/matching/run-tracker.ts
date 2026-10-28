@@ -54,6 +54,8 @@ const SITE_NAME: Record<string, string> = {
     dreamjobs: "DreamJobs",
     ikman: "ikman",
     xpress: "Xpress",
+    findmyjob: "FindMyJob",
+    finders: "Finders",
 };
 const siteName = (source: string) => SITE_NAME[source] ?? source;
 

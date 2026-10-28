@@ -95,7 +95,11 @@ if (ingestIntervalMinutes > 0) {
       const results = await collectVacancies();
       console.log("Ingest finished:", results.map((r) => `${r.source}=${r.fetched}${r.error ? " (failed)" : ""}`).join(" "));
 
-      if (enrichPerRun > 0) console.log("Adverts read:", await enrichPending("topjobs", enrichPerRun));
+      if (enrichPerRun > 0) {
+        for (const source of ["topjobs", "finders", "findmyjob"] as const) {
+          console.log(`Adverts read (${source}):`, await enrichPending(source, enrichPerRun));
+        }
+      }
     } catch (error) {
       console.error("Ingest failed:", error);
     } finally {

@@ -6,7 +6,9 @@ export type JobSourceId =
     | "rooster"
     | "dreamjobs"
     | "ikman"
-    | "xpress";
+    | "xpress"
+    | "findmyjob"
+    | "finders";
 
 /** A vacancy normalised across all sources. */
 export interface JobPosting {

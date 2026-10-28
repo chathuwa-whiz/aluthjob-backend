@@ -10,6 +10,8 @@ const PORTAL_DOMAINS = new Set([
     "dreamjobs.lk",
     "ikman.lk",
     "xpress.jobs",
+    "findmyjob.lk",
+    "finders.lk",
     "rooster.jobs",
     "mytutor.lk",
     "efuturetech.com",

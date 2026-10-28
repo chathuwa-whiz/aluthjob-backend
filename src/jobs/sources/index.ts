@@ -1,4 +1,6 @@
 import { dreamjobs } from "./dreamjobs.js";
+import { finders } from "./finders.js";
+import { findmyjob } from "./findmyjob.js";
 import { governmentjobs } from "./governmentjobs.js";
 import { ikman } from "./ikman.js";
 import { jobpal } from "./jobpal.js";
@@ -17,6 +19,8 @@ export const sources: Record<JobSourceId, JobSource> = {
     dreamjobs,
     ikman,
     xpress,
+    findmyjob,
+    finders,
 };
 
 export const sourceIds = Object.keys(sources) as JobSourceId[];
