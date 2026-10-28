@@ -4,7 +4,7 @@ import { ensureVacancies } from "../jobs/collection.service.js";
 import { enrichJob, type SiteEvent } from "../jobs/ingest.service.js";
 import { listJobs, type StoredJob } from "../jobs/job.repository.js";
 import { buildSubject, draftCoverLetter } from "./cover-letter.service.js";
-import { getMatch, listMatches, saveConfirmedEmail, saveDraft, saveMatches, setStatus, type Match, type NewMatch } from "./match.repository.js";
+import { getMatch, listMatches, recordPortalApplication, saveConfirmedEmail, saveDraft, saveMatches, setStatus, type Match, type NewMatch } from "./match.repository.js";
 import { buildCorpus, buildProfileModel, scoreJob } from "./scoring.js";
 import { RateLimiter } from "../auth/rate-limit.js";
 import { SingleFlight, WorkBudget } from "../security/work-budget.js";
@@ -199,6 +199,7 @@ export async function editCoverLetter(matchId: number, edits: { subject?: string
 export async function approveMatch(matchId: number): Promise<Match> {
     const match = await getMatch(matchId);
     if (!match) throw new NotFoundError("Match not found");
+    if (match.appliedOnSiteAt) throw new RuleError("You already recorded applying on the job site");
 
     if (!match.coverLetter?.trim()) throw new RuleError("Write or generate a cover letter before approving");
     if (match.job.closingAt && match.job.closingAt < new Date().toISOString()) {
@@ -206,6 +207,15 @@ export async function approveMatch(matchId: number): Promise<Match> {
     }
 
     await setStatus(matchId, "approved");
+    return (await getMatch(matchId))!;
+}
+
+/** Records the user's own confirmation; opening a link never implies an application. */
+export async function markAppliedOnSite(matchId: number): Promise<Match> {
+    const match = await getMatch(matchId);
+    if (!match) throw new NotFoundError("Match not found");
+    if (!(await recordPortalApplication(matchId))) throw new RuleError("This vacancy accepts applications by email; approve the letter before sending");
+    // Recording a completed action is allowed after the vacancy's closing date too.
     return (await getMatch(matchId))!;
 }
 

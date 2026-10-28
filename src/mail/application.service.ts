@@ -38,6 +38,7 @@ export function needsAddressConfirmation(match: Match): boolean {
 export function sendProblems(match: Match, hasMailbox: boolean, ownAddress?: string): string[] {
     const problems: string[] = [];
 
+    if (match.appliedOnSiteAt) problems.push("You already applied on the job site");
     if (match.status !== "approved") problems.push("Approve the match first");
     if (!match.coverLetter?.trim()) problems.push("The cover letter is empty");
     if (!match.job.applyEmail) problems.push("This vacancy publishes no employer email; apply on the job site instead");
@@ -157,6 +158,8 @@ export async function queueApproved(candidateId: number, matchIds?: number[]): P
 
     for (const match of await listMatches(candidateId, { status: "approved", limit: 200 })) {
         if (wanted && !wanted.has(match.id)) continue;
+        // An external completion is tracked under Approved, but is never a mail-queue item.
+        if (match.appliedOnSiteAt) continue;
 
         try {
             const { application, created } = await queueMatch(match.id);

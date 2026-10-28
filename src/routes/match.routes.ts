@@ -3,7 +3,7 @@ import { z } from "zod";
 import { currentUser } from "../auth/middleware.js";
 import { ownedMatch } from "../auth/ownership.js";
 import { previewMessage, queueMatch } from "../mail/application.service.js";
-import { approveMatch, confirmAddress, editCoverLetter, rejectMatch, writeCoverLetter } from "../matching/match.service.js";
+import { approveMatch, confirmAddress, editCoverLetter, markAppliedOnSite, rejectMatch, writeCoverLetter } from "../matching/match.service.js";
 
 const router = Router();
 
@@ -37,6 +37,10 @@ router.patch("/:id", async (req, res) => {
 
 router.post("/:id/approve", async (req, res) => {
     res.json({ success: true, data: await approveMatch(await matchIdOf(req)) });
+});
+
+router.post("/:id/applied-on-site", async (req, res) => {
+    res.json({ success: true, data: await markAppliedOnSite(await matchIdOf(req)) });
 });
 
 // The exact email that would go out, and whatever currently blocks it

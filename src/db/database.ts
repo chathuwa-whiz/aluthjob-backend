@@ -231,6 +231,8 @@ const SCHEMA = [
         cover_letter     CLOB,
         drafted_at       VARCHAR2(40),
         decided_at       VARCHAR2(40),
+        -- explicit confirmation of an application completed outside AluthJob
+        applied_on_site_at VARCHAR2(40),
         -- the address the user confirmed after checking it against the original ad image
         confirmed_email  VARCHAR2(320),
         created_at       VARCHAR2(40) NOT NULL,
@@ -390,6 +392,13 @@ async function open(): Promise<oracledb.Pool> {
         const connection = await pool.getConnection();
         try {
             for (const statement of SCHEMA) await connection.execute(statement);
+            // Existing installations predate external-application tracking. Ignore only the
+            // duplicate-column error, including when another process applied this migration.
+            try {
+                await connection.execute("ALTER TABLE matches ADD applied_on_site_at VARCHAR2(40)");
+            } catch (error) {
+                if ((error as { errorNum?: number }).errorNum !== 1430) throw error;
+            }
         } finally {
             await connection.close();
         }

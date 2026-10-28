@@ -105,7 +105,7 @@ async function changeCandidateOwner(candidateId: number, userId: number | null, 
         const at = new Date().toISOString();
         await tx.run("DELETE FROM mail_accounts WHERE candidate_id = ?", [candidateId]);
         await tx.run("UPDATE applications SET status = 'cancelled', error = ?, updated_at = ? WHERE candidate_id = ? AND status IN ('queued', 'failed')", ["Resume ownership changed; connect a mailbox and approve again before sending", at, candidateId]);
-        await tx.run("UPDATE matches SET status = CASE WHEN status = 'approved' THEN 'suggested' ELSE status END, confirmed_email = NULL, updated_at = ? WHERE candidate_id = ?", [at, candidateId]);
+        await tx.run("UPDATE matches SET status = CASE WHEN status = 'approved' THEN 'suggested' ELSE status END, confirmed_email = NULL, applied_on_site_at = NULL, updated_at = ? WHERE candidate_id = ?", [at, candidateId]);
         await tx.run("UPDATE candidates SET user_id = ?, updated_at = ? WHERE id = ?", [userId, at, candidateId]);
         return true;
     });

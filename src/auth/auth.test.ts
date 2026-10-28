@@ -820,3 +820,62 @@ describe("resume ownership key", () => {
 function seed_profile() {
     return { personalInfo: { fullName: "P", email: null, phone: null, location: null, linkedin: null, portfolio: null }, skills: [], education: [], experience: [], certifications: [], achievements: [] };
 }
+
+describe("applications completed on an employer site", () => {
+    beforeEach(async () => { await clearDatabase(); });
+
+    async function portalFixture() {
+        const owner = await signUp("portal-owner@example.com");
+        const ids = await seed(owner.id, "portal-owner");
+        const db = m.db.getDatabase();
+        await db.run("DELETE FROM applications WHERE candidate_id = ?", [ids.candidateId]);
+        await m.mailboxes.deleteMailAccount(ids.candidateId);
+        await db.run("UPDATE jobs SET apply_email = NULL, closing_at = ? WHERE id = ?", ["2020-01-01T00:00:00.000Z", ids.jobId]);
+        await db.run("UPDATE matches SET status = 'suggested', subject = NULL, cover_letter = NULL, drafted_at = NULL, decided_at = NULL WHERE id = ?", [ids.matchId]);
+        return { owner, ids };
+    }
+
+    it("records an external application without a letter or mailbox and moves it from review to Approved", async () => {
+        const { owner, ids } = await portalFixture();
+        const path = `/matches/${ids.matchId}/applied-on-site`;
+        const recorded = await request("POST", path, { cookie: owner.cookie, body: {} });
+        assert.equal(recorded.status, 200, JSON.stringify(recorded.json));
+        assert.equal(recorded.json.data.status, "approved");
+        assert.equal(recorded.json.data.coverLetter, null);
+        assert.ok(recorded.json.data.appliedOnSiteAt);
+        assert.equal(recorded.json.data.decidedAt, recorded.json.data.appliedOnSiteAt);
+        const reviewed = await request("GET", `/candidates/${ids.candidateId}/matches?status=suggested`, { cookie: owner.cookie });
+        const approved = await request("GET", `/candidates/${ids.candidateId}/matches?status=approved`, { cookie: owner.cookie });
+        assert.deepEqual(reviewed.json.data, []);
+        assert.deepEqual(approved.json.data.map((match: { id: number }) => match.id), [ids.matchId]);
+        assert.deepEqual(await m.apps.listApplications(ids.candidateId), [], "recording a portal submission never queues email");
+        const repeated = await request("POST", path, { cookie: owner.cookie });
+        assert.equal(repeated.status, 200);
+        assert.equal(repeated.json.data.appliedOnSiteAt, recorded.json.data.appliedOnSiteAt);
+    });
+
+    it("keeps external completion after optional letter edits and another matching run", async () => {
+        const { owner, ids } = await portalFixture();
+        await request("POST", `/matches/${ids.matchId}/applied-on-site`, { cookie: owner.cookie });
+        const before = (await m.matches.getMatch(ids.matchId))!;
+        const edited = await request("PATCH", `/matches/${ids.matchId}`, { cookie: owner.cookie, body: { subject: "Optional letter", coverLetter: "An optional letter to copy into the portal" } });
+        assert.equal(edited.status, 200);
+        assert.equal(edited.json.data.status, "approved");
+        assert.equal(edited.json.data.appliedOnSiteAt, before.appliedOnSiteAt);
+        await m.matches.saveMatches(ids.candidateId, []);
+        assert.equal((await m.matches.getMatch(ids.matchId))!.status, "approved");
+    });
+
+    it("requires ownership and cannot replace email-letter approval", async () => {
+        const { owner, ids } = await portalFixture();
+        const stranger = await signUp("portal-stranger@example.com");
+        assert.equal((await request("POST", `/matches/${ids.matchId}/applied-on-site`, { cookie: stranger.cookie })).status, 404);
+        assert.equal((await m.matches.getMatch(ids.matchId))!.status, "suggested");
+        await m.db.getDatabase().run("UPDATE jobs SET apply_email = ? WHERE id = ?", ["hr@employer.test", ids.jobId]);
+        const rejected = await request("POST", `/matches/${ids.matchId}/applied-on-site`, { cookie: owner.cookie });
+        assert.equal(rejected.status, 409);
+        assert.equal((await m.matches.getMatch(ids.matchId))!.appliedOnSiteAt, null);
+        const noLetter = await request("POST", `/matches/${ids.matchId}/approve`, { cookie: owner.cookie });
+        assert.equal(noLetter.status, 409, "email approval still requires a letter");
+    });
+});

@@ -198,6 +198,24 @@ describe("connecting a mailbox", () => {
 });
 
 describe("queueing", () => {
+    it("never emails a recorded external application even if enrichment later discovers an address", async () => {
+        const match = await approvedMatch({ email: null, approve: false });
+        const recorded = await m.matchService.markAppliedOnSite(match.id);
+        assert.equal(recorded.status, "approved");
+        assert.ok(recorded.appliedOnSiteAt);
+        await m.db.getDatabase().run("UPDATE jobs SET apply_email = ? WHERE id = ?", ["newly-found@employer.test", match.jobId]);
+        const enriched = (await m.matches.getMatch(match.id))!;
+        assert.equal(enriched.applyMethod, "email");
+        assert.equal(enriched.appliedOnSiteAt, recorded.appliedOnSiteAt);
+        await assert.rejects(m.service.queueMatch(match.id), /already applied on the job site/);
+        assert.deepEqual(await m.service.queueApproved(candidateId), { queued: [], skipped: [] });
+        assert.equal(await m.apps.getApplicationByMatch(match.id), undefined);
+        await m.matches.saveDraft(match.id, "Optional revised letter", "Updated optional letter");
+        assert.equal((await m.matches.getMatch(match.id))!.status, "approved");
+        await m.matches.setStatus(match.id, "suggested");
+        assert.equal((await m.matches.getMatch(match.id))!.appliedOnSiteAt, null, "explicitly reopening removes the completion marker");
+    });
+
     it("only queues approved matches that have a usable employer email", async () => {
         await assert.rejects(async () => await m.service.queueMatch((await approvedMatch({ approve: false })).id), /Approve the match first/);
         await assert.rejects(async () => await m.service.queueMatch((await approvedMatch({ email: null })).id), /no employer email/);

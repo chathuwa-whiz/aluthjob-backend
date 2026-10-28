@@ -18,6 +18,8 @@ export interface Match {
     coverLetter: string | null;
     draftedAt: string | null;
     decidedAt: string | null;
+    /** The user explicitly confirmed completing an application on the employer's site. */
+    appliedOnSiteAt: string | null;
     /** The employer address the user checked against the original advert; only counts while it equals the job's address. */
     confirmedEmail: string | null;
     createdAt: string;
@@ -38,6 +40,7 @@ interface MatchRow {
     cover_letter: string | null;
     drafted_at: string | null;
     decided_at: string | null;
+    applied_on_site_at: string | null;
     confirmed_email: string | null;
     created_at: string;
     updated_at: string;
@@ -55,6 +58,7 @@ function toMatch(row: MatchRow, job: StoredJob): Match {
         coverLetter: row.cover_letter,
         draftedAt: row.drafted_at,
         decidedAt: row.decided_at,
+        appliedOnSiteAt: row.applied_on_site_at,
         confirmedEmail: row.confirmed_email,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
@@ -160,12 +164,13 @@ export async function listMatches(candidateId: number, filter: MatchFilter = {})
 export async function saveDraft(id: number, subject: string, coverLetter: string): Promise<void> {
     const now = new Date().toISOString();
 
-    // A new draft must be looked at again, so any earlier approval is withdrawn
+    // Email approval covers the exact letter; external completion records a real-world
+    // action and must survive edits to an optional letter.
     await getDatabase().run(
         `UPDATE matches
          SET subject = ?, cover_letter = ?, drafted_at = ?, updated_at = ?,
-             status = CASE WHEN status = 'approved' THEN 'suggested' ELSE status END,
-             decided_at = CASE WHEN status = 'approved' THEN NULL ELSE decided_at END
+             status = CASE WHEN status = 'approved' AND applied_on_site_at IS NULL THEN 'suggested' ELSE status END,
+             decided_at = CASE WHEN status = 'approved' AND applied_on_site_at IS NULL THEN NULL ELSE decided_at END
          WHERE id = ?`,
         [subject, coverLetter, now, now, id],
     );
@@ -174,7 +179,21 @@ export async function saveDraft(id: number, subject: string, coverLetter: string
 export async function setStatus(id: number, status: MatchStatus): Promise<void> {
     const now = new Date().toISOString();
 
-    await getDatabase().run("UPDATE matches SET status = ?, decided_at = ?, updated_at = ? WHERE id = ?", [status, status === "suggested" ? null : now, now, id]);
+    await getDatabase().run("UPDATE matches SET status = ?, decided_at = ?, updated_at = ?, applied_on_site_at = CASE WHEN ? = 'approved' THEN applied_on_site_at ELSE NULL END WHERE id = ?", [status, status === "suggested" ? null : now, now, status, id]);
+}
+
+/** Only a vacancy without an employer email can acquire external-application authority. */
+export async function recordPortalApplication(id: number): Promise<boolean> {
+    const now = new Date().toISOString();
+    const result = await getDatabase().run(
+        `UPDATE matches SET status = 'approved',
+             decided_at = COALESCE(applied_on_site_at, ?),
+             applied_on_site_at = COALESCE(applied_on_site_at, ?), updated_at = ?
+         WHERE id = ? AND (applied_on_site_at IS NOT NULL OR
+             EXISTS (SELECT 1 FROM jobs WHERE jobs.id = matches.job_id AND jobs.apply_email IS NULL))`,
+        [now, now, now, id],
+    );
+    return result.changes === 1;
 }
 
 /** Records that the user checked this address against the original advert. */
